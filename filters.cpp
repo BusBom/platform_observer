@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <vector>
 
+static std::vector<cv::Mat> lab_channels;
+static cv::Mat lab;
 static std::vector<std::pair<cv::Point, int>> ach_points;
 static std::vector<int> ach_brightness;
 static std::vector<cv::Point> prev_rect;
@@ -10,6 +12,25 @@ static int target_width;
 static int target_height;
 static std::vector<cv::Point2f> dst_points;
 static cv::Mat perspective_matrix;
+
+
+void auto_brightness_balance(cv::Mat &bgr_image, cv::Mat& dst_image){
+
+    cv::cvtColor(bgr_image, lab, cv::COLOR_BGR2Lab);
+
+    lab_channels.clear();
+    cv::split(lab, lab_channels);
+
+     cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE();
+    clahe->setClipLimit(2.0); // 대비 제한
+    clahe->setTilesGridSize(cv::Size(8, 8));
+    clahe->apply(lab_channels[0], lab_channels[0]); // L* 채널 //97% 85% 여전히 다름
+
+    // 다시 합치고 변환
+    cv::merge(lab_channels, lab);
+
+    cv::cvtColor(lab, dst_image, cv::COLOR_Lab2BGR);
+}
 
 void warp_rectified_area(cv::Mat &bgr_image, cv::Mat &dst_image, std::vector<cv::Point> &rect)
 {

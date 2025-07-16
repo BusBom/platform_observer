@@ -4,18 +4,20 @@
 #include <queue>
 #include <thread>
 
-//#include <libcamera/libcamera.h>
-//#include <libcamera/libcamera_app.h>
+// #include <libcamera/libcamera.h>
+// #include <libcamera/libcamera_app.h>
 
+#include "checker.hpp"
 #include "filters.hpp"
 #include "safeQueue.hpp"
 
 #define MAX_QUEUE_SIZE 1000
+#define PLATFORM_SIZE 4
 
 const char cap_name[] = "test.MP4";
-//const char cap_name[] = 
-//  "libcamerasrc ! video/x-raw,format=BGR,width=640,height=480,framerate=30/1 ! "
-//  "videoconvert ! appsink";
+// const char cap_name[] =
+//   "libcamerasrc ! video/x-raw,format=BGR,width=640,height=480,framerate=30/1
+//   ! " "videoconvert ! appsink";
 bool is_capture_thread_running = true;
 
 static ThreadSafeQueue<std::shared_ptr<cv::Mat>> frame_queue;
@@ -33,6 +35,11 @@ unsigned int frame_wasted = 0;
 unsigned int warped_wasted = 0;
 unsigned int masked_wasted = 0;
 
+/*bus*/
+bool BUS_PLATFORM_STATUS[PLATFORM_SIZE] = {
+    false,
+};
+
 int main() {
   cv::VideoCapture cap(cap_name);
   cv::Mat firstImage;
@@ -48,11 +55,27 @@ int main() {
     cv::waitKey(30);
   }
 
+  // 점 4개 수집되면 사각형 그리기
+  if (clicked_points.size() == 4) {
+    cv::Mat image_with_rect = firstImage.clone();
+
+    // 선택된 점을 선으로 연결하여 사각형 그리기
+    for (int i = 0; i < 4; ++i) {
+      cv::line(image_with_rect, clicked_points[i], clicked_points[(i + 1) % 4],
+               cv::Scalar(0, 255, 0), 2);
+      cv::circle(image_with_rect, clicked_points[i], 5, cv::Scalar(0, 0, 255),
+                 -1);  // 점 표시
+    }
+
+    // 사각형 표시된 이미지 보여주기
+    cv::imshow("original", image_with_rect);
+  }
+
   std::thread tcapture(capture_thread);
   std::thread twarp(warp_thread);
   std::thread tmask(mask_thread);
 
-   // 디버깅 윈도우 설정
+  // 디버깅 윈도우 설정
   cv::namedWindow("mask", cv::WINDOW_NORMAL);
   cv::resizeWindow("mask", 1000, 800);
 
@@ -62,7 +85,13 @@ int main() {
     if (masked_queue.try_pop(result)) {
       if (result && !result->empty()) {
         cv::imshow("mask", *result);
-        std::cout << "left masked : " << masked_queue.size() << "\n";
+        check_bus_platforms(*result, PLATFORM_SIZE, BUS_PLATFORM_STATUS);
+
+        for (int i = 0; i < PLATFORM_SIZE; i++) {
+          std::cout << BUS_PLATFORM_STATUS[i] << ' ';
+        }
+        std::cout << '\n';
+
       } else {
         std::cout << "Invalid or empty frame received.\n";
       }
@@ -79,7 +108,8 @@ int main() {
   twarp.join();
   tmask.join();
 
-  std::cout << masked_wasted << ' ' << warped_wasted << ' ' << masked_wasted << '\n';
+  std::cout << masked_wasted << ' ' << warped_wasted << ' ' << masked_wasted
+            << '\n';
 
   cv::destroyAllWindows();
   return 0;
@@ -114,7 +144,7 @@ void capture_thread() {
 
   const int target_fps = 30;
   const std::chrono::milliseconds frame_duration(1000 / target_fps);
-  cv::Mat frame;
+  cv::Mat frame, balanced;
   std::shared_ptr<cv::Mat> garbage;
   while (true) {
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -126,7 +156,10 @@ void capture_thread() {
       frame_queue.try_pop(garbage);
       frame_wasted++;
     }
-    frame_queue.push(std::make_shared<cv::Mat>(std::move(frame)));
+
+    auto_brightness_balance(frame, balanced);
+
+    frame_queue.push(std::make_shared<cv::Mat>(std::move(balanced)));
 
     auto elapsed = std::chrono::high_resolution_clock::now() - start_time;
     std::cout << "org: "
@@ -203,6 +236,7 @@ void mask_thread() {
     if (warped_queue.try_pop(frame)) {
       remove_achromatic_area((*frame), masked_1);  // default : 0.15
       revive_white_area(masked_1, masked_2);       // default : 95%
+
       masked_queue.push(std::make_shared<cv::Mat>(std::move(masked_2)));
     }
 

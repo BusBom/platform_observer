@@ -10,7 +10,7 @@ find_package(OpenCV REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBCAMERA REQUIRED libcamera)
 
-add_executable(station_checker main.cpp filters.cpp)
+add_executable(station_checker main.cpp filters.cpp checker.cpp)
 
 target_link_libraries(station_checker ${OpenCV_LIBS})
 include_directories(
