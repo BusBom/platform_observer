@@ -7,7 +7,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 find_package(OpenCV REQUIRED)
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBCAMERA REQUIRED libcamera)
+
 add_executable(station_checker main.cpp filters.cpp)
 
 target_link_libraries(station_checker ${OpenCV_LIBS})
-include_directories(${OpenCV_INCLUDE_DIRS})
+include_directories(
+    ${OpenCV_INCLUDE_DIRS}
+    ${LIBCAMERA_INCLUDE_DIRS}
+    )
