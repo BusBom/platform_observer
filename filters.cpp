@@ -55,8 +55,10 @@ void warp_rectified_area(cv::Mat &bgr_image, cv::Mat &dst_image, std::vector<cv:
         float heightA = cv::norm(src_points[3] - src_points[0]); // left
         float heightB = cv::norm(src_points[2] - src_points[1]); // right
 
+        float scale_factor = 1.2;
+
         target_width = (int)(std::max(widthA, widthB));
-        target_height = (int)(std::max(heightA, heightB));
+        target_height = (int)(std::max(heightA, heightB) * scale_factor); // you can add scale_factor
 
         dst_points = {
             {0.f, 0.f},
