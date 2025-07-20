@@ -11,8 +11,8 @@
 #define MAX_QUEUE_SIZE 1000
 
 
-unsigned int PLATFORM_SIZE = 10;
-const char cap_name[] = "test.MP4";
+unsigned int PLATFORM_SIZE = 5;
+const char cap_name[] = "test.mp4";
 // const char cap_name[] =
 //   "libcamerasrc ! video/x-raw,format=BGR,width=640,height=480,framerate=30/1
 //   ! " "videoconvert ! appsink";
@@ -37,6 +37,8 @@ static std::vector<cv::Point> temp_points;
 static int current_platform_index = 0;
 static bool ready_to_start = false;
 
+
+//for debugging
 void onMouseClick(int event, int x, int y, int flags, void* userdata) {
   if (event != cv::EVENT_LBUTTONDOWN || current_platform_index >= PLATFORM_SIZE)
     return;
@@ -111,39 +113,41 @@ void onMouseClick(int event, int x, int y, int flags, void* userdata) {
 }
 
 void wait_for_user_clicks(cv::VideoCapture& cap) {
-  cv::Mat frame;
-
-  cv::namedWindow("Select Platforms", cv::WINDOW_NORMAL);
-  cv::resizeWindow("Select Platforms", 800, 600);
-  cv::setMouseCallback("Select Platforms", onMouseClick, nullptr);
-
-  std::cout << "💡 Tip: Select 4 points in clockwise order (top-left, top-right, bottom-right, bottom-left)\n";
-
-  while (!ready_to_start) {
+    cv::Mat frame;
+    // 첫 프레임만 읽어서 저장
     cap >> frame;
-    if (frame.empty()) break;
+    if (frame.empty()) return;
 
-    // 현재 선택 중인 플랫폼 정보 표시
-    std::string status_text = "Platform " + std::to_string(current_platform_index) + 
-                             " (" + std::to_string(temp_points.size()) + "/4 points)";
-    cv::putText(frame, status_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+    cv::namedWindow("Select Platforms", cv::WINDOW_NORMAL);
+    cv::resizeWindow("Select Platforms", 800, 600);
+    cv::setMouseCallback("Select Platforms", onMouseClick, nullptr);
 
-    // 이미 선택한 플랫폼 그리기
-    for (int i = 0; i < current_platform_index; ++i) {
-      auto& pts = clicked_points[i];
-      for (int j = 0; j < 4; ++j)
-        cv::line(frame, pts[j], pts[(j + 1) % 4], cv::Scalar(255, 10*i, 0), 2);
+    std::cout << "💡 Tip: Select 4 points in clockwise order (top-left, top-right, bottom-right, bottom-left)\n";
+
+    while (!ready_to_start) {
+        cv::Mat display = frame.clone();
+
+        // 현재 선택 중인 플랫폼 정보 표시
+        std::string status_text = "Platform " + std::to_string(current_platform_index) +
+                                 " (" + std::to_string(temp_points.size()) + "/4 points)";
+        cv::putText(display, status_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+
+        // 이미 선택한 플랫폼 그리기
+        for (int i = 0; i < current_platform_index; ++i) {
+            auto& pts = clicked_points[i];
+            for (int j = 0; j < 4; ++j)
+                cv::line(display, pts[j], pts[(j + 1) % 4], cv::Scalar(255, 10*i, 0), 2);
+        }
+
+        // 현재 선택 중인 점 표시
+        for (const auto& pt : temp_points)
+            cv::circle(display, pt, 5, cv::Scalar(0, 255, 0), -1);
+
+        cv::imshow("Select Platforms", display);
+        if (cv::waitKey(30) == 27) break;  // ESC 누르면 종료
     }
 
-    // 현재 선택 중인 점 표시
-    for (const auto& pt : temp_points)
-      cv::circle(frame, pt, 5, cv::Scalar(0, 255, 0), -1);
-
-    cv::imshow("Select Platforms", frame);
-    if (cv::waitKey(30) == 27) break;  // ESC 누르면 종료
-  }
-
-  cv::destroyWindow("Select Platforms");
+    cv::destroyWindow("Select Platforms");
 }
 
 /*end debuging */
@@ -203,9 +207,15 @@ for (int i = 0; i < PLATFORM_SIZE; ++i) {
 }
 
 auto frame_start = std::chrono::high_resolution_clock::now();
-while (is_capture_thread_running) {
+while (is_capture_thread_running || !masked_queue.empty()) {
   if (masked_queue.try_pop(masked)) {
     last_masked = *masked;
+
+    check_bus_platform(last_masked, BUS_PLATFORM_STATUS);
+    for(int i = 0; i < last_masked.size(); i++){
+      std::cout << "Platform " << i << " status: " << BUS_PLATFORM_STATUS[i] << std::endl;
+    }
+
     auto frame_end = std::chrono::high_resolution_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(frame_end - frame_start).count();
     std::cout << "[main] Frame output time: " << elapsed << " ms" << std::endl;

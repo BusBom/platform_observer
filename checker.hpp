@@ -3,6 +3,7 @@
 
 #include <opencv2/opencv.hpp>
 
-bool check_bus_platform(cv::Mat& platform);
+void check_bus_platform(const std::vector<cv::Mat>& platform_masks, bool* status, 
+    double min_white_ratio = 0.4);
 
 #endif
