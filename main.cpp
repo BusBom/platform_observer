@@ -1,163 +1,256 @@
 // clone 하는 부분 최대한 출일 것, shared_ptr => 관련 글쓰기
-#include <chrono>
+#include <chrono> //warp 되는 것까지 확인함, 화면 디버깅 지우고, 다음 단계로 넘어갈 것것
 #include <iostream>
 #include <queue>
 #include <thread>
-
-// #include <libcamera/libcamera.h>
-// #include <libcamera/libcamera_app.h>
 
 #include "checker.hpp"
 #include "filters.hpp"
 #include "safeQueue.hpp"
 
 #define MAX_QUEUE_SIZE 1000
-#define PLATFORM_SIZE 4
 
+
+unsigned int PLATFORM_SIZE = 10;
 const char cap_name[] = "test.MP4";
 // const char cap_name[] =
 //   "libcamerasrc ! video/x-raw,format=BGR,width=640,height=480,framerate=30/1
 //   ! " "videoconvert ! appsink";
 bool is_capture_thread_running = true;
 
+static std::vector<std::vector<cv::Point>> clicked_points(PLATFORM_SIZE);
 static ThreadSafeQueue<std::shared_ptr<cv::Mat>> frame_queue;
-static std::vector<cv::Point> clicked_points;
-static ThreadSafeQueue<std::shared_ptr<cv::Mat>> warped_queue;
-static ThreadSafeQueue<std::shared_ptr<cv::Mat>> masked_queue;
+static ThreadSafeQueue<std::shared_ptr<std::vector<cv::Mat>>> warped_queue;
+static ThreadSafeQueue<std::shared_ptr<std::vector<cv::Mat>>> masked_queue;
 
-void onMouseClick(int event, int x, int y, int flags, void *userdata);
 void capture_thread();
 void warp_thread();
 void mask_thread();
 
-/*variable for debugging */
+/*start debugging */
 unsigned int total_frame = 0;
 unsigned int frame_wasted = 0;
 unsigned int warped_wasted = 0;
 unsigned int masked_wasted = 0;
 
-/*bus*/
-bool BUS_PLATFORM_STATUS[PLATFORM_SIZE] = {
-    false,
-};
+static std::vector<cv::Point> temp_points;
+static int current_platform_index = 0;
+static bool ready_to_start = false;
 
-int main()
-{
+void onMouseClick(int event, int x, int y, int flags, void* userdata) {
+  if (event != cv::EVENT_LBUTTONDOWN || current_platform_index >= PLATFORM_SIZE)
+    return;
+
+  temp_points.emplace_back(x, y);
+  std::cout << "Point " << temp_points.size() << " for Platform "
+            << current_platform_index << ": (" << x << ", " << y << ")\n";
+
+  if (temp_points.size() == 4) {
+    // 사각형 유효성 검증
+    bool is_valid_rectangle = true;
+    
+    // 1. 모든 점이 서로 다른지 확인
+    for (int i = 0; i < 4; ++i) {
+      for (int j = i + 1; j < 4; ++j) {
+        if (temp_points[i] == temp_points[j]) {
+          std::cout << "Error: Duplicate points detected!" << std::endl;
+          is_valid_rectangle = false;
+          break;
+        }
+      }
+    }
+    
+    // 2. 최소 크기 확인 (너무 작은 사각형 방지)
+    if (is_valid_rectangle) {
+      int min_x = std::min({temp_points[0].x, temp_points[1].x, temp_points[2].x, temp_points[3].x});
+      int max_x = std::max({temp_points[0].x, temp_points[1].x, temp_points[2].x, temp_points[3].x});
+      int min_y = std::min({temp_points[0].y, temp_points[1].y, temp_points[2].y, temp_points[3].y});
+      int max_y = std::max({temp_points[0].y, temp_points[1].y, temp_points[2].y, temp_points[3].y});
+      
+      int width = max_x - min_x;
+      int height = max_y - min_y;
+      
+      if (width < 10 || height < 10) {
+        std::cout << "Error: Rectangle too small! (width: " << width << ", height: " << height << ")" << std::endl;
+        is_valid_rectangle = false;
+      }
+    }
+    
+    if (is_valid_rectangle) {
+      // clicked_points에 안전하게 할당
+      clicked_points[current_platform_index].clear(); // 기존 내용 제거
+      clicked_points[current_platform_index].reserve(4); // 메모리 예약
+      clicked_points[current_platform_index] = temp_points; // 복사
+      
+      // 할당 후 검증
+      if (clicked_points[current_platform_index].size() != 4) {
+        std::cout << "Error: Failed to assign points to platform " << current_platform_index << std::endl;
+        temp_points.clear();
+        return;
+      }
+      
+      std::cout << "Platform " << current_platform_index << " selected successfully.\n";
+      std::cout << "  Points: (" << temp_points[0].x << "," << temp_points[0].y << ") "
+                << "(" << temp_points[1].x << "," << temp_points[1].y << ") "
+                << "(" << temp_points[2].x << "," << temp_points[2].y << ") "
+                << "(" << temp_points[3].x << "," << temp_points[3].y << ")\n";
+      std::cout << "  Stored points count: " << clicked_points[current_platform_index].size() << std::endl;
+      
+      current_platform_index++;
+      temp_points.clear();
+    } else {
+      std::cout << "Invalid rectangle! Please select 4 points again for Platform " << current_platform_index << ".\n";
+      temp_points.clear();
+    }
+  }
+
+  if (current_platform_index == PLATFORM_SIZE) {
+    std::cout << "All platforms selected.\n";
+    ready_to_start = true;
+  }
+}
+
+void wait_for_user_clicks(cv::VideoCapture& cap) {
+  cv::Mat frame;
+
+  cv::namedWindow("Select Platforms", cv::WINDOW_NORMAL);
+  cv::resizeWindow("Select Platforms", 800, 600);
+  cv::setMouseCallback("Select Platforms", onMouseClick, nullptr);
+
+  std::cout << "💡 Tip: Select 4 points in clockwise order (top-left, top-right, bottom-right, bottom-left)\n";
+
+  while (!ready_to_start) {
+    cap >> frame;
+    if (frame.empty()) break;
+
+    // 현재 선택 중인 플랫폼 정보 표시
+    std::string status_text = "Platform " + std::to_string(current_platform_index) + 
+                             " (" + std::to_string(temp_points.size()) + "/4 points)";
+    cv::putText(frame, status_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+
+    // 이미 선택한 플랫폼 그리기
+    for (int i = 0; i < current_platform_index; ++i) {
+      auto& pts = clicked_points[i];
+      for (int j = 0; j < 4; ++j)
+        cv::line(frame, pts[j], pts[(j + 1) % 4], cv::Scalar(255, 10*i, 0), 2);
+    }
+
+    // 현재 선택 중인 점 표시
+    for (const auto& pt : temp_points)
+      cv::circle(frame, pt, 5, cv::Scalar(0, 255, 0), -1);
+
+    cv::imshow("Select Platforms", frame);
+    if (cv::waitKey(30) == 27) break;  // ESC 누르면 종료
+  }
+
+  cv::destroyWindow("Select Platforms");
+}
+
+/*end debuging */
+
+/*bus*/
+bool BUS_PLATFORM_STATUS[20] = {
+    false,
+}; //MAX_PLATFORM_SIZE = 20
+
+int main() {
   cv::VideoCapture cap(cap_name);
-  cv::Mat firstImage;
-  cap >> firstImage;
+  if (!cap.isOpened()) {
+    std::cerr << "Failed to open video source.\n";
+    return -1;
+  }
+
+  // clicked_points 벡터 초기화 확인
+  std::cout << "Initial clicked_points size: " << clicked_points.size() << std::endl;
+  for (int i = 0; i < clicked_points.size(); ++i) {
+    std::cout << "Platform " << i << " initial size: " << clicked_points[i].size() << std::endl;
+  }
+
+  std::cout << "📌 사용자 클릭으로 플랫폼 영역을 지정하세요 (총 "
+            << PLATFORM_SIZE << "개).\n";
+  wait_for_user_clicks(cap);
+  
+  // 선택 완료 후 clicked_points 상태 확인
+  std::cout << "\n=== Final clicked_points status ===" << std::endl;
+  for (int i = 0; i < clicked_points.size(); ++i) {
+    std::cout << "Platform " << i << " has " << clicked_points[i].size() << " points: ";
+    if (clicked_points[i].size() == 4) {
+      for (int j = 0; j < 4; ++j) {
+        std::cout << "(" << clicked_points[i][j].x << "," << clicked_points[i][j].y << ") ";
+      }
+    } else {
+      std::cout << "INVALID - missing points!";
+    }
+    std::cout << std::endl;
+  }
+  std::cout << "===================================\n" << std::endl;
+
   cap.release();
 
-  cv::namedWindow("original", cv::WINDOW_NORMAL);
-  cv::resizeWindow("original", 1000, 800);
-  cv::setMouseCallback("original", onMouseClick, &clicked_points);
-  cv::imshow("original", firstImage);
+  std::thread cap_thread(capture_thread);
+  std::thread warp_thread_(warp_thread);
+  std::thread mask_thread_(mask_thread);
 
-  while (clicked_points.size() != 4)
-  {
-    cv::waitKey(30);
+// GUI 이벤트 처리를 위한 메인 루프 및 masked_queue imshow
+std::shared_ptr<std::vector<cv::Mat>> masked;
+std::vector<cv::Mat> last_masked; // 마지막으로 표시한 프레임 저장
+
+// 창을 한 번만 생성
+for (int i = 0; i < PLATFORM_SIZE; ++i) {
+  std::string win_name = "Masked Platform " + std::to_string(i);
+  cv::namedWindow(win_name, cv::WINDOW_NORMAL);
+  cv::resizeWindow(win_name, 800, 600);
+}
+
+auto frame_start = std::chrono::high_resolution_clock::now();
+while (is_capture_thread_running) {
+  if (masked_queue.try_pop(masked)) {
+    last_masked = *masked;
+    auto frame_end = std::chrono::high_resolution_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(frame_end - frame_start).count();
+    std::cout << "[main] Frame output time: " << elapsed << " ms" << std::endl;
+    frame_start = std::chrono::high_resolution_clock::now();
   }
 
-  // 점 4개 수집되면 사각형 그리기
-  if (clicked_points.size() == 4)
-  {
-    cv::Mat image_with_rect = firstImage.clone();
-
-    // 선택된 점을 선으로 연결하여 사각형 그리기
-    for (int i = 0; i < 4; ++i)
-    {
-      cv::line(image_with_rect, clicked_points[i], clicked_points[(i + 1) % 4],
-               cv::Scalar(0, 255, 0), 2);
-      cv::circle(image_with_rect, clicked_points[i], 5, cv::Scalar(0, 0, 255),
-                 -1); // 점 표시
+  // 항상 마지막 프레임을 반복적으로 그려줌
+  for (int i = 0; i < last_masked.size(); ++i) {
+    if (!last_masked[i].empty()) {
+      std::string win_name = "Masked Platform " + std::to_string(i);
+      cv::Mat resized_masked;
+      cv::resize(last_masked[i], resized_masked, cv::Size(800, 600));
+      cv::imshow(win_name, resized_masked);
     }
-
-    // 사각형 표시된 이미지 보여주기
-    cv::imshow("original", image_with_rect);
   }
 
-  std::thread tcapture(capture_thread);
-  std::thread twarp(warp_thread);
-  std::thread tmask(mask_thread);
-
-  // 디버깅 윈도우 설정
-  cv::namedWindow("mask", cv::WINDOW_NORMAL);
-  cv::resizeWindow("mask", 1000, 800);
-
-  // main에서 직접 imshow 실행
-  std::shared_ptr<cv::Mat> result;
-  while (is_capture_thread_running || !masked_queue.empty())
-  {
-    if (masked_queue.try_pop(result))
-    {
-      if (result && !result->empty())
-      {
-        cv::imshow("mask", *result);
-
-        check_bus_platforms(*result, PLATFORM_SIZE, BUS_PLATFORM_STATUS);
-
-        for (int i = 0; i < PLATFORM_SIZE; i++)
-        {
-           std::cout << BUS_PLATFORM_STATUS[i] << ' ';
-        }
-        std::cout << '\n';
-      }
-      else
-      {
-        std::cout << "Invalid or empty frame received.\n";
-      }
-    }
-
-    char c = (char)cv::waitKey(30); // 반드시 GUI 갱신을 위해 필요
-    if (c == 'q')
-      break;
-
-    // 너무 자주 루프가 돌지 않게 대기
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  int key = cv::waitKey(30); // 루프당 한 번만 호출
+  if (key == 27) {
+    is_capture_thread_running = false;
+    break;
   }
+}
 
-  tcapture.join();
-  twarp.join();
-  tmask.join();
+  // 스레드 종료 대기
+  cap_thread.join();
+  warp_thread_.join();
+  mask_thread_.join();
 
-  std::cout << total_frame << ' ' << masked_wasted << ' ' << warped_wasted << ' ' << masked_wasted
-            << '\n';
-
+  // 모든 창 닫기
   cv::destroyAllWindows();
+  
+  std::cout << "Program done : " << total_frame << ":" 
+    << frame_wasted << ":" << warped_wasted << ":" << masked_wasted << std::endl;
+
   return 0;
 }
 
-void onMouseClick(int event, int x, int y, int flags, void *userdata)
-{
-  if (event != cv::EVENT_LBUTTONDOWN)
-    return;
-
-  std::vector<cv::Point> *points_vec =
-      static_cast<std::vector<cv::Point> *>(userdata);
-
-  if (points_vec->size() >= 4)
-  {
-    std::cout << "🔄 Point list is full. Clearing list." << std::endl;
-    points_vec->clear();
-  }
-
-  points_vec->push_back(cv::Point(x, y));
-  std::cout << "📌 Point added: (" << x << ", " << y
-            << "). Total points: " << points_vec->size() << std::endl;
-}
-
-void capture_thread()
-{
+void capture_thread() {
   cv::VideoCapture cap(cap_name);
 
-  if (!cap.isOpened())
-  {
+  if (!cap.isOpened()) {
     std::cout << "ERROR: Could not open camera\n";
     is_capture_thread_running = false;
     return;
-  }
-  else
-  {
+  } else {
     is_capture_thread_running = true;
   }
 
@@ -165,16 +258,13 @@ void capture_thread()
   const std::chrono::milliseconds frame_duration(1000 / target_fps);
   cv::Mat frame, balanced;
   std::shared_ptr<cv::Mat> garbage;
-  while (true)
-  {
+  while (true) {
     auto start_time = std::chrono::high_resolution_clock::now();
-    if (!cap.read(frame) || frame.empty())
-    {
+    if (!cap.read(frame) || frame.empty()) {
       break;
     }
 
-    if (frame_queue.size() > MAX_QUEUE_SIZE)
-    {
+    if (frame_queue.size() > MAX_QUEUE_SIZE) {
       frame_queue.try_pop(garbage);
       frame_wasted++;
     }
@@ -182,131 +272,107 @@ void capture_thread()
     auto_brightness_balance(frame, balanced);
 
     total_frame++;
+
     frame_queue.push(std::make_shared<cv::Mat>(std::move(balanced)));
 
     auto elapsed = std::chrono::high_resolution_clock::now() - start_time;
-    /*std::cout << "org: "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
-                     .count()
-              << " : " << frame_queue.size() << '\n';*/
     auto sleep_time =
         frame_duration -
         std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
 
-    if (sleep_time > std::chrono::milliseconds(0))
-    {
-      std::this_thread::sleep_for(sleep_time); // CPU 낭비 방지
+    if (sleep_time > std::chrono::milliseconds(0)) {
+      std::this_thread::sleep_for(sleep_time);  // CPU 낭비 방지
     }
   }
 
-  std::cout << "done!!" << '\n';
   cap.release();
   is_capture_thread_running = false;
 }
 
-void warp_thread()
-{
+bool is_every_rects_ready(std::vector<std::vector<cv::Point>>& rects){
+  for(int i = 0; i < rects.size(); i++){
+      if(rects[i].empty() || rects[i].size() != 4)
+        return false;
+  }
+
+  return true;
+}
+
+void warp_thread() {
+
   const int target_fps = 30;
   const std::chrono::milliseconds frame_duration(1000 / target_fps);
 
-  cv::Mat warped;
-  std::shared_ptr<cv::Mat> frame, garbage;
-  while (is_capture_thread_running)
-  {
-    auto start_time = std::chrono::high_resolution_clock::now();
+  std::shared_ptr<cv::Mat> frame;
+  std::shared_ptr<std::vector<cv::Mat>> garbage;
+  std::vector<cv::Mat> warped;
 
-    if (clicked_points.size() != 4)
-    {
+  while (is_capture_thread_running || !frame_queue.empty()) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+    warped.clear(); // 초기화하지 않음
+
+    // 조건문 수정: || 로 변경하고 로직 개선
+    if (clicked_points.size() != PLATFORM_SIZE || !is_every_rects_ready(clicked_points)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      continue; // 아직 포인트가 준비 안됨
+      continue;  // 아직 포인트가 준비 안됨
     }
 
-    if (warped_queue.size() > MAX_QUEUE_SIZE)
-    {
+    if (warped_queue.size() > MAX_QUEUE_SIZE) {
       warped_queue.try_pop(garbage);
       warped_wasted++;
     }
 
-    if (frame_queue.try_pop(frame))
-    {
-      warp_rectified_area((*frame), warped, clicked_points);
-      warped_queue.push(std::make_shared<cv::Mat>(std::move(warped)));
+    if (frame_queue.try_pop(frame)) {
+      warp_rectified_areas((*frame), warped, clicked_points);
+      warped_queue.push(std::make_shared<std::vector<cv::Mat>>(std::move(warped)));
     }
 
     auto elapsed = std::chrono::high_resolution_clock::now() - start_time;
-    /*std::cout << "warp: "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
-                     .count()
-              << " : " << warped_queue.size() << '\n';*/
     auto sleep_time =
-        frame_duration -
-        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
+        frame_duration - std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
 
-    if (sleep_time > std::chrono::milliseconds(0))
-    {
-      std::this_thread::sleep_for(sleep_time); // CPU 낭비 방지
+    if (sleep_time > std::chrono::milliseconds(0)) {
+      std::this_thread::sleep_for(sleep_time);  // CPU 낭비 방지
     }
   }
-
-  cv::destroyWindow("warped");
 }
 
-void mask_thread()
-{
+void mask_thread() {
+
   const int target_fps = 30;
   const std::chrono::milliseconds frame_duration(1000 / target_fps);
 
-  cv::Mat masked_1, masked_2;
-  std::shared_ptr<cv::Mat> frame, garbage;
-  while (is_capture_thread_running)
-  {
+  std::shared_ptr<std::vector<cv::Mat>> frame;
+  std::shared_ptr<std::vector<cv::Mat>> garbage;
+  std::vector<cv::Mat> masked_1, masked_2;
+  
+  while (is_capture_thread_running || !warped_queue.empty()) {
     auto start_time = std::chrono::high_resolution_clock::now();
-
-    if (masked_queue.size() > MAX_QUEUE_SIZE)
-    {
+    
+    if (masked_queue.size() > MAX_QUEUE_SIZE) {
       masked_queue.try_pop(garbage);
       masked_wasted++;
     }
 
-    if (warped_queue.try_pop(frame))
-    {
-      remove_achromatic_area((*frame), masked_1); // default : 0.15
-      revive_white_area(masked_1, masked_2);  // default : 95%
+    if (warped_queue.try_pop(frame)) {
+      masked_1.resize(PLATFORM_SIZE);
+      masked_2.resize(PLATFORM_SIZE);
+      
+      remove_achromatic_areas((*frame), masked_1);  // default : 0.15
+      revive_white_areas(masked_1, masked_2);       // default : 95%
 
-      masked_queue.push(std::make_shared<cv::Mat>(std::move(masked_2)));
+      masked_queue.push(std::make_shared<std::vector<cv::Mat>>(std::move(masked_2)));
     }
-
+      
     auto elapsed = std::chrono::high_resolution_clock::now() - start_time;
-    /*std::cout << "masked: "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
-                     .count()
-              << " : " << masked_queue.size() << '\n';*/
-    auto sleep_time = frame_duration -
-                      std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
+    auto sleep_time =
+        frame_duration -
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
 
-    if (sleep_time > std::chrono::milliseconds(0))
-    {
-      std::this_thread::sleep_for(sleep_time); // CPU 낭비 방지
+    if (sleep_time > std::chrono::milliseconds(0)) {
+      std::this_thread::sleep_for(sleep_time);  // CPU 낭비 방지
     }
   }
+
 }
 
-// DEBUG
-/*
-std::chrono::system_clock::time_point start = std::chrono::system_clock::now();
-            warp_rectified_area(frame, warped, clicked_points);
-            remove_achromatic_area(warped, mask, 0.15);
-            revive_white_area(mask, remask);
-            std::chrono::system_clock::time_point end =
-std::chrono::system_clock::now();; std::chrono::duration<double, std::milli>
-msec = end - start;
-
-auto start_time = std::chrono::high_resolution_clock::now();
-auto elapsed = std::chrono::high_resolution_clock::now() - start_time;
-        start_time = std::chrono::high_resolution_clock::now();
-        std::cout << "total: "
-                  << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
-                         .count()
-                  << " : " << frame_queue.size() << '\n';
-
-*/
