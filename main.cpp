@@ -1,4 +1,3 @@
-// clone 하는 부분 최대한 출일 것, shared_ptr => 관련 글쓰기
 #include <chrono> //warp 되는 것까지 확인함, 화면 디버깅 지우고, 다음 단계로 넘어갈 것것
 #include <iostream>
 #include <queue>
@@ -10,9 +9,14 @@
 
 #define MAX_QUEUE_SIZE 1000
 
+/** 현재 조정 상황
+유채색 vs 무채색 : 0.15
+영역 내 흰색 판단 : 70 (상위 30%)
+버스 또는 물체 유무 판단 : 0.4
+*/
 
-unsigned int PLATFORM_SIZE = 5;
-const char cap_name[] = "test.mp4";
+unsigned int PLATFORM_SIZE = 1;
+const char cap_name[] = "test_3.mp4";
 // const char cap_name[] =
 //   "libcamerasrc ! video/x-raw,format=BGR,width=640,height=480,framerate=30/1
 //   ! " "videoconvert ! appsink";
