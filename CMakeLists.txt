@@ -29,5 +29,7 @@ target_include_directories(station_checker PRIVATE
 target_link_libraries(station_checker PRIVATE
     ${OpenCV_LIBS}
     ${LIBCAMERA_LIBRARIES}
-    pthread      # POSIX 쓰레드를 사용하는 경우
+    pthread             # POSIX 쓰레드를 사용하는 경우
+    rt                  # 공유 메모리 함수용 librt
+    X11
 )
