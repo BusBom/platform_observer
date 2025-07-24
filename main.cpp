@@ -1,8 +1,9 @@
 /**
  * @file main.cpp
- * @brief 유닉스 도메인 소켓으로 ROI 설정과 영상 스트림을 받아 버스를 감지하는 메인 프로그램.
+ * @brief 유닉스 도메인 소켓으로 ROI 설정과 영상 스트림을 받아 버스를 감지하고,
+ *        정제된 감지 결과를 공유 메모리에 기록하는 메인 프로그램
  */
-#include <chrono> //warp 되는 것까지 확인함, 화면 디버깅 지우고, 다음 단계로 넘어갈 것것
+#include <chrono> //warp 되는 것까지 확인함, 화면 디버깅 지우고, 다음 단계로 넘어갈 것
 #include <iostream>
 #include <thread>
 #include <atomic>
@@ -17,17 +18,20 @@
 #include <sys/stat.h>       // chmod
 #include <sys/select.h>     // select
 
-#include "checker.hpp"
-#include "filters.hpp"
+#include "checker.hpp"      // check_bus_platform
+#include "filters.hpp"      // 차량 마스킹
 #include "safeQueue.hpp"
+#include "stop_status.hpp"  // StopStatus 구조체
 #include <X11/Xlib.h>       // XInitThreads
+
 // 상수 정의
-#define MAX_QUEUE_SIZE 2
-#define MAX_PLATFORM_COUNT 20       //플랫폼 개수 설정
+#define MAX_QUEUE_SIZE 2            // 큐사이즈가 클수록 딜레이 증가
+#define MAX_PLATFORM_COUNT 20       // 최대 플랫폼 수
 
 // 통신 경로
-#define SHM_NAME "/busbom_frame"
-#define SOCKET_PATH "/tmp/roi_socket"
+#define SHM_NAME_FRAME "/busbom_frame"      // live stream 
+#define SHM_NAME_STATUS "/busbom_status"    // bus stop status
+#define SOCKET_PATH "/tmp/roi_socket"       // roi info
 
 // 프레임 설정
 #define FRAME_WIDTH  1280
@@ -37,6 +41,8 @@
 // --- 전역 설정 ---
 const int TARGET_FPS = 15;
 const std::chrono::milliseconds FRAME_DURATION(1000 / TARGET_FPS);
+const char* STATION_ID = "S001";    // 정류장 ID, 추후 확장 가능
+const int STABLE_THRESHOLD = 20;     // 정차로 판단하기 위한 연속 감지 프레임 수 ( 30 = 2초 )
 
 // --- 전역 변수 ---
 unsigned int PLATFORM_SIZE = 0;
@@ -46,6 +52,15 @@ std::mutex rois_mutex;
 
 std::atomic<bool> running(true);
 std::atomic<bool> is_config_ready(false);           // ROI 설정 완료 여부 플래그
+
+// --- 공유 메모리 포인터 (상태 출력용) ---
+int status_shm_fd = -1;
+StopStatus* status_shm_ptr = nullptr;
+
+// --- 상태 안정화(Debouncing)용 변수 ---
+static int detect_counter[MAX_PLATFORM_COUNT] = {0};
+static int stable_status[MAX_PLATFORM_COUNT] = {0};
+static int miss_counter[MAX_PLATFORM_COUNT] = {0};
 
 // --- 데이터 큐 ---
 static ThreadSafeQueue<std::shared_ptr<cv::Mat>> frame_queue;
@@ -59,18 +74,21 @@ unsigned int frame_wasted = 0;
 unsigned int warped_wasted = 0;
 unsigned int masked_wasted = 0;
 
-
-/** 현재 조정 상황
-유채색 vs 무채색 : 0.15
-영역 내 흰색 판단 : 70 (상위 30%)
-버스 또는 물체 유무 판단 : 0.4
+/** 현재 조정 상황 (filters.cpp 참고)
+* 유채색 vs 무채색 : 0.15
+* 영역 내 흰색 판단 : 70 (상위 30%)
+* 버스 또는 물체 유무 판단 : 0.4
 */
+
+void initialize_platform_status(unsigned int platform_count);
+void process_bus_status(unsigned int platform_count, const bool* raw_status);
+void update_shared_status(unsigned int platform_count);
+void video_read_thread(const std::string& video_filename);
 
 void signal_handler(int signum) {
     std::cout << "\nTermination signal received. Shutting down..." << std::endl;
     running.store(false);
 }
-
 
 /**
  * @brief CGI 스크립트로부터 유닉스 도메인 소켓을 통해 바이너리 ROI 설정을 수신하는 스레드.
@@ -162,7 +180,9 @@ void receive_roi_config_thread() {
                 std::lock_guard<std::mutex> lock(rois_mutex);
                 platform_rois = temp_rois;
                 PLATFORM_SIZE = platform_rois.size();
-                std::fill_n(BUS_PLATFORM_STATUS, MAX_PLATFORM_COUNT, false);
+                
+                // 플랫폼 상태 및 공유 메모리 초기화
+                initialize_platform_status(PLATFORM_SIZE);
 
                 std::cout << "✅ ROI configuration updated. Total platforms: " << PLATFORM_SIZE << std::endl;
                 is_config_ready = true;
@@ -184,9 +204,9 @@ void shm_read_thread() {
     const size_t frame_size = FRAME_WIDTH * FRAME_HEIGHT * FRAME_CHANNELS;
     int shm_fd = -1;
     
-    std::cout << "Trying to connect to shared memory " << SHM_NAME << "..." << std::endl;
+    std::cout << "Trying to connect to shared memory " << SHM_NAME_FRAME << "..." << std::endl;
     while(shm_fd == -1 && running.load()) {
-        shm_fd = shm_open(SHM_NAME, O_RDONLY, 0666);
+        shm_fd = shm_open(SHM_NAME_FRAME, O_RDONLY, 0666);
         if (shm_fd == -1) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
@@ -217,6 +237,7 @@ void shm_read_thread() {
         cv::Mat local_frame;
         shared_frame.copyTo(local_frame);
 
+        // ----- Debug -----
         cv::Mat debug_frame = local_frame.clone();
         {
             std::lock_guard<std::mutex> lock(rois_mutex);
@@ -227,6 +248,7 @@ void shm_read_thread() {
         if (debug_frame_queue.size() < 10) {
              debug_frame_queue.push(std::make_shared<cv::Mat>(std::move(debug_frame)));
         }
+        // ----------------
 
         if (frame_queue.size() > MAX_QUEUE_SIZE) {
             frame_queue.try_pop(garbage);
@@ -249,11 +271,113 @@ void shm_read_thread() {
 }
 
 /**
+ * @brief 상태 정보를 기록할 공유 메모리를 설정합니다.
+ * @return 성공 시 true, 실패 시 false
+ */
+bool setup_status_shm() {
+    umask(0);
+    status_shm_fd = shm_open(SHM_NAME_STATUS, O_CREAT | O_RDWR, 0666);
+    if (status_shm_fd == -1) {
+        perror("shm_open for status failed");
+        return false;
+    }
+
+    if (ftruncate(status_shm_fd, sizeof(StopStatus)) == -1) {
+        perror("ftruncate for status failed");
+        close(status_shm_fd);
+        shm_unlink(SHM_NAME_STATUS);
+        return false;
+    }
+
+    status_shm_ptr = (StopStatus*)mmap(0, sizeof(StopStatus), PROT_WRITE, MAP_SHARED, status_shm_fd, 0);
+    if (status_shm_ptr == MAP_FAILED) {
+        perror("mmap for status failed");
+        close(status_shm_fd);
+        shm_unlink(SHM_NAME_STATUS);
+        status_shm_ptr = nullptr;
+        return false;
+    }
+
+    std::cout << "✅ Status shared memory '" << SHM_NAME_STATUS << "' is ready." << std::endl;
+    return true;
+}
+
+/**
+ * @brief 프로그램 종료 시 상태 공유 메모리를 해제합니다.
+ */
+void cleanup_status_shm() {
+    if (status_shm_ptr != nullptr && status_shm_ptr != MAP_FAILED) {
+        munmap(status_shm_ptr, sizeof(StopStatus));
+    }
+    if (status_shm_fd != -1) {
+        close(status_shm_fd);
+    }
+    shm_unlink(SHM_NAME_STATUS);
+    std::cout << "Status shared memory cleaned up." << std::endl;
+}
+
+
+/**
+ * @brief ROI 설정에 따라 플랫폼 상태 및 공유 메모리를 초기화합니다.
+ */
+void initialize_platform_status(unsigned int platform_count) {
+    if (status_shm_ptr == nullptr) return;
+
+    for (unsigned int i = 0; i < MAX_PLATFORM_COUNT; ++i) {
+        detect_counter[i] = 0;
+        stable_status[i] = 0;
+        if (i < platform_count) {
+            status_shm_ptr->platform_status[i] = 0; // 사용 플랫폼은 0(empty)으로 초기화
+        } else {
+            status_shm_ptr->platform_status[i] = -1; // 미사용 플랫폼은 -1로 초기화
+        }
+    }
+    strncpy(status_shm_ptr->station_id, STATION_ID, sizeof(status_shm_ptr->station_id) - 1);
+    status_shm_ptr->updated_at = time(nullptr);
+}
+
+/**
+ * @brief 원본 감지 결과를 안정화된 상태로 변환합니다.
+ */
+void process_bus_status(unsigned int platform_count, const bool* raw_status) {
+    for (unsigned int i = 0; i < platform_count; ++i) {
+        if (raw_status[i]) {            // 버스가 감지되면
+            miss_counter[i] = 0;        //실패 카운터 초기화
+            if(detect_counter[i] < STABLE_THRESHOLD) {
+                detect_counter[i]++;
+            }
+            if (detect_counter[i] >= STABLE_THRESHOLD) {
+                stable_status[i] = 1;   // 상태를 1(정차)로 변경
+            }
+        } else { 
+            miss_counter[i]++;
+            if(miss_counter[i] >= 3) {  // 3프레임 이상 연속 감지 실패 시 감지 카운터 초기화
+                detect_counter[i] = 0; 
+                stable_status[i] = 0; 
+            }
+
+        }
+    }
+}
+
+/**
+ * @brief 안정화된 상태를 공유 메모리에 업데이트합니다.
+ */
+void update_shared_status(unsigned int platform_count) {
+    if (status_shm_ptr == nullptr) return;
+
+    for (unsigned int i = 0; i < platform_count; ++i) {
+        status_shm_ptr->platform_status[i] = stable_status[i];
+    }
+    status_shm_ptr->updated_at = time(nullptr);
+}
+
+/**
  * @brief 프레임을 큐에서 가져와 투시 변환(warp)을 수행하는 스레드 함수.
  */
 void warp_thread() {
-std::shared_ptr<cv::Mat> frame;
-    std::shared_ptr<std::vector<cv::Mat>> garbage;
+    std::shared_ptr<cv::Mat> frame;
+    std::shared_ptr<cv::Mat> garbage;
 
     while (running.load() || !frame_queue.empty()) {
         auto start_time = std::chrono::high_resolution_clock::now();
@@ -269,8 +393,9 @@ std::shared_ptr<cv::Mat> frame;
             continue;
         }
 
+        // 오래된 프레임을 버려서 지연시간을 줄임
         while (frame_queue.size() > MAX_QUEUE_SIZE && running.load()) {
-            frame_queue.try_pop(frame);
+            frame_queue.try_pop(garbage);
             frame_wasted++;
         }
 
@@ -305,7 +430,7 @@ void mask_thread() {
             continue;
         }
 
-        // 큐에 프레임이 너무 많이 쌓이면 오래된 프레임을 버려서 지연시간을 줄임
+        // 오래된 프레임을 버려서 지연시간을 줄임
         while (warped_queue.size() > MAX_QUEUE_SIZE && running.load()) {
             warped_queue.try_pop(garbage);
             warped_wasted++;
@@ -324,23 +449,22 @@ void mask_thread() {
 }
 
 /**
- * @brief 로컬 영상 파일에서 프레임을 읽어와 큐에 넣는 스레드 함수
+ * @brief 영상 파일에서 프레임을 읽어와 큐에 넣는 스레드 함수
  */
-void video_read_thread(const std::string& video_path) {
+void video_read_thread(const std::string& video_filename) {
+    const std::string base_path = "file://home/Qwd/platform_observer/video/";
+    std::string video_path = base_path + video_filename;
+
     cv::VideoCapture cap(video_path);
     if (!cap.isOpened()) {
-        std::cerr << "failed to open viedo: " << video_path << std::endl;
+        std::cerr << "Failed to open viedo file: " << video_path << std::endl;
         running.store(false);
         return;
     }
 
     std::cout << "success open the file: " << video_path << std::endl;
 
-    // 🎯 영상 FPS에 맞춰 sleep 시간 계산
-    double video_fps = cap.get(cv::CAP_PROP_FPS);
-    int delay_ms = (video_fps > 1.0) ? static_cast<int>(1000.0 / video_fps) : 33;
-    std::chrono::milliseconds frame_delay(delay_ms);
-
+    cv::Mat balanced;  // 밝기 조정 필요시 사용
     cv::Mat frame, resized;
     std::shared_ptr<cv::Mat> garbage;
 
@@ -349,10 +473,10 @@ void video_read_thread(const std::string& video_path) {
 
         if (!cap.read(frame) || frame.empty()) break;
 
-        // 👉 프레임 리사이즈
+        // 프레임 리사이즈
         cv::resize(frame, resized, cv::Size(FRAME_WIDTH, FRAME_HEIGHT));
 
-        // 👉 디버그용 ROI 오버레이
+        // ---- 디버그용 ROI 오버레이 ----
         {
             std::lock_guard<std::mutex> lock(rois_mutex);
             if (!platform_rois.empty()) {
@@ -363,21 +487,21 @@ void video_read_thread(const std::string& video_path) {
         if (debug_frame_queue.size() < 10) {
             debug_frame_queue.push(std::make_shared<cv::Mat>(resized.clone()));
         }
+        // ----------------------------
 
+        // 오래된 프레임을 버려서 지연시간을 줄임
         if (frame_queue.size() > MAX_QUEUE_SIZE) {
             frame_queue.try_pop(garbage);
             frame_wasted++;
         }
 
-        frame_queue.push(std::make_shared<cv::Mat>(std::move(resized)));
+        auto_brightness_balance(resized, balanced);
         total_frame++;
+        frame_queue.push(std::make_shared<cv::Mat>(std::move(balanced)));
 
-        // 💡 영상 fps 기준 sleep
-        // auto elapsed = std::chrono::high_resolution_clock::now() - start;
-        // auto sleep_time = frame_delay - std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
-        // if (sleep_time > std::chrono::milliseconds(0)) {
-        //     std::this_thread::sleep_for(sleep_time);
-        // }
+        // frame_queue.push(std::make_shared<cv::Mat>(std::move(resized)));
+        // total_frame++;
+
         auto elapsed = std::chrono::high_resolution_clock::now() - start;
         auto sleep_time = FRAME_DURATION - std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
         if (sleep_time > std::chrono::milliseconds(0)) {
@@ -390,25 +514,40 @@ void video_read_thread(const std::string& video_path) {
 }
 
 
-int main() {
+int main(int argc, char *argv[]) {
     XInitThreads(); // GUI 멀티스레딩 안정성 확보
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    std::thread roi_config_thread(receive_roi_config_thread);
+    if (!setup_status_shm()) {
+        return 1;
+    }
 
-    std::thread reader_thread(video_read_thread, "file://home/Qwd/platform_observer/video/IMG_4403.mp4");
-    //std::thread reader_thread(shm_read_thread);
+    std::thread roi_config_thread(receive_roi_config_thread);
+    std::thread reader_thread;
+
+    // 프로그램 인자에 따라 영상 소스 결정
+    if (argc > 1) {
+        // 인자로 영상 파일 경로가 주어지면 비디오 파일 모드로 실행
+        std::cout << "Starting in video file mode with: " << argv[1] << std::endl;
+        reader_thread = std::thread(video_read_thread, std::string(argv[1]));
+    } else {
+        // 인자가 없으면 기본값인 공유 메모리 모드로 실행
+        std::cout << "Starting in shared memory mode." << std::endl;
+        reader_thread = std::thread(shm_read_thread);
+    }
 
     // 처리 스레드들을 담을 변수
     std::thread warp_thread_;
     std::thread mask_thread_;
     bool processing_threads_started = false;
 
+    std::cout << "✅ Main process running. Waiting for initial CGI configuration via socket..." << std::endl;
+
+    // ---- debug: 변수 선언 ----
     cv::Mat last_raw_frame_with_rois;
     std::vector<cv::Mat> last_masked_frames;
-
-    std::cout << "✅ Main process running. Waiting for initial CGI configuration via socket..." << std::endl;
+    // -------------------------
 
     while (running.load()) {
         // ROI 설정이 완료되었고, 처리 스레드가 아직 시작되지 않았다면 시작
@@ -419,38 +558,46 @@ int main() {
             processing_threads_started = true;
         }
 
-        // 원본 프레임 가져와서 표시
+        // ---- debug: 원본 프레임 가져와서 표시 ----
         std::shared_ptr<cv::Mat> debug_frame;
         if (debug_frame_queue.try_pop(debug_frame)) {
-            last_raw_frame_with_rois = *debug_frame;
+            cv::imshow("Debug View", *debug_frame);
         }
-        if (!last_raw_frame_with_rois.empty()) {
-            cv::imshow("Raw Frame with ROIs", last_raw_frame_with_rois);
-        }
+        // --------------------------------------
 
-        // 처리된 마스크 프레임 가져와서 표시
         if (is_config_ready.load()) {
             std::shared_ptr<std::vector<cv::Mat>> masked;
             if (masked_queue.try_pop(masked)) {
+                // 1. 감지 결과 확인
                 check_bus_platform(*masked, BUS_PLATFORM_STATUS);
-                for (unsigned int i = 0; i < masked->size(); i++) {
-                    std::cout << "Platform " << i << " status: " << (BUS_PLATFORM_STATUS[i] ? "BUS DETECTED" : "empty") << std::endl;
+
+                // 2. 감지 결과 안정화
+                process_bus_status(PLATFORM_SIZE, BUS_PLATFORM_STATUS);
+
+                // 3. 안정화된 결과를 공유 메모리에 업데이트
+                update_shared_status(PLATFORM_SIZE);
+                
+                // 콘솔 디버그 출력
+                std::cout << "--- Platform Status Updated (Stable) ---" << std::endl;
+                for (unsigned int i = 0; i < PLATFORM_SIZE; i++) {
+                    std::cout << "  Platform " << i << ": " << (stable_status[i] ? "BUS DETECTED" : "Empty")
+                              << " (Counter: " << detect_counter[i] << ")" << std::endl;
                 }
                 last_masked_frames = *masked;
             }
+
+            // ---- debug: mask 확인용 ----
             for (size_t i = 0; i < last_masked_frames.size(); ++i) {
                 if (!last_masked_frames[i].empty()) {
                     std::string win_name = "Debug View - Platform " + std::to_string(i);
                     cv::imshow(win_name, last_masked_frames[i]);
                 }
             }
+            // ---------------------------
+            cv::waitKey(1);
         }
 
-        // ✔ GUI 창이 있을 경우 imshow 이후에도 최소한의 이벤트 처리를 위해 다음 줄 추가
-        cv::waitKey(1);  // 블록되지 않음. GUI 창이 안 뜰 경우 이 줄도 삭제 가능
-
         std::this_thread::sleep_for(std::chrono::milliseconds(10)); // CPU 과점유 방지용
-
     }
 
     std::cout << "Shutting down all threads..." << std::endl;
@@ -461,7 +608,9 @@ int main() {
     std::cout << "Shutting down config thread..." << std::endl;
     if(roi_config_thread.joinable()) roi_config_thread.join();
 
+    cleanup_status_shm();
     cv::destroyAllWindows();
+
     std::cout << "Program done. Total frames: " << total_frame << ", Wasted: " 
               << frame_wasted << "/" << warped_wasted << "/" << masked_wasted << std::endl;
     return 0;

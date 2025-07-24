@@ -17,6 +17,11 @@ add_executable(station_checker
     main.cpp 
     filters.cpp 
     checker.cpp
+
+    checker.hpp
+    filters.hpp
+    safeQueue.hpp
+    stop_status.hpp
 )
 
 # 포함 디렉터리 설정

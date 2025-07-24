@@ -16,7 +16,7 @@ void remove_achromatic_area(cv::Mat &bgrImage, cv::Mat &dst_mask,
 bool is_achromatic(const cv::Vec3b &bgr, float threshold);
 
 void revive_white_areas(std::vector<cv::Mat> &bgrImages, std::vector<cv::Mat> &dst_masks, 
-    int threshold_br = 70);
+    int threshold_br = 65);
 void revive_white_area(cv::Mat &src_mask, cv::Mat &dst_mask, 
     int index, int threshold_br = 70);
 
