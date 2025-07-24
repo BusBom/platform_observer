@@ -17,6 +17,11 @@ add_executable(station_checker
     main.cpp 
     filters.cpp 
     checker.cpp
+
+    checker.hpp
+    filters.hpp
+    safeQueue.hpp
+    stop_status.hpp
 )
 
 # 포함 디렉터리 설정
@@ -30,4 +35,6 @@ target_link_libraries(station_checker PRIVATE
     ${OpenCV_LIBS}
     ${LIBCAMERA_LIBRARIES}
     pthread      # POSIX 쓰레드를 사용하는 경우
+    rt                  # 공유 메모리 함수용 librt
+    X11
 )
