@@ -38,7 +38,7 @@ g++ -o platform_observer platform_main.cpp `pkg-config --cflags --libs opencv4` 
 
 다른 프로세스(예: GStreamer)가 `/busbom_frame` 공유 메모리로 영상 프레임을 송출하는 환경에서 사용합니다.
 
-./platform_observer
+```./platform_observer```
 
 
 ### 2. 비디오 파일 모드 (디버깅용)
@@ -47,8 +47,9 @@ g++ -o platform_observer platform_main.cpp `pkg-config --cflags --libs opencv4` 
 
 -   **참고**: 코드 내에 기본 영상 경로가 `/home/Qwd/platform_observer/video/`로 설정되어 있습니다.
 
-# /home/Qwd/platform_observer/video/IMG_4403.mp4 파일을 재생
-./platform_observer IMG_4403.mp4
+** /home/Qwd/platform_observer/video/IMG_4403.mp4 파일을 재생 **
+
+```./platform_observer IMG_4403.mp4```
 
 ---
 
