@@ -1,5 +1,6 @@
 #include <opencv2/opencv.hpp>
 #include <vector>
+#include <string>
 
 void check_bus_platform(const std::vector<cv::Mat>& platform_masks, 
     bool* status, double min_white_ratio) {
@@ -9,6 +10,8 @@ void check_bus_platform(const std::vector<cv::Mat>& platform_masks,
             status[i] = false;
             continue;
         }
+
+        cv::imwrite("img/masked_" + std::to_string(i) + ".jpg", mask);
 
         cv::Mat binary;
         if (mask.channels() == 3) {

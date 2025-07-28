@@ -15,8 +15,8 @@
 버스 또는 물체 유무 판단 : 0.4
 */
 
-unsigned int PLATFORM_SIZE = 1;
-const char cap_name[] = "test_3.mp4";
+unsigned int PLATFORM_SIZE = 15;
+const char cap_name[] = "test.MP4";
 // const char cap_name[] =
 //   "libcamerasrc ! video/x-raw,format=BGR,width=640,height=480,framerate=30/1
 //   ! " "videoconvert ! appsink";
@@ -41,7 +41,7 @@ static std::vector<cv::Point> temp_points;
 static int current_platform_index = 0;
 static bool ready_to_start = false;
 
-
+ 
 //for debugging
 void onMouseClick(int event, int x, int y, int flags, void* userdata) {
   if (event != cv::EVENT_LBUTTONDOWN || current_platform_index >= PLATFORM_SIZE)
@@ -52,10 +52,9 @@ void onMouseClick(int event, int x, int y, int flags, void* userdata) {
             << current_platform_index << ": (" << x << ", " << y << ")\n";
 
   if (temp_points.size() == 4) {
-    // 사각형 유효성 검증
     bool is_valid_rectangle = true;
-    
-    // 1. 모든 점이 서로 다른지 확인
+
+    // 1. 중복 점 확인
     for (int i = 0; i < 4; ++i) {
       for (int j = i + 1; j < 4; ++j) {
         if (temp_points[i] == temp_points[j]) {
@@ -65,43 +64,40 @@ void onMouseClick(int event, int x, int y, int flags, void* userdata) {
         }
       }
     }
-    
-    // 2. 최소 크기 확인 (너무 작은 사각형 방지)
+
+    // 2. 최소 크기 확인
     if (is_valid_rectangle) {
       int min_x = std::min({temp_points[0].x, temp_points[1].x, temp_points[2].x, temp_points[3].x});
       int max_x = std::max({temp_points[0].x, temp_points[1].x, temp_points[2].x, temp_points[3].x});
       int min_y = std::min({temp_points[0].y, temp_points[1].y, temp_points[2].y, temp_points[3].y});
       int max_y = std::max({temp_points[0].y, temp_points[1].y, temp_points[2].y, temp_points[3].y});
-      
+
       int width = max_x - min_x;
       int height = max_y - min_y;
-      
+
       if (width < 10 || height < 10) {
         std::cout << "Error: Rectangle too small! (width: " << width << ", height: " << height << ")" << std::endl;
         is_valid_rectangle = false;
       }
     }
-    
+
     if (is_valid_rectangle) {
-      // clicked_points에 안전하게 할당
-      clicked_points[current_platform_index].clear(); // 기존 내용 제거
-      clicked_points[current_platform_index].reserve(4); // 메모리 예약
-      clicked_points[current_platform_index] = temp_points; // 복사
-      
-      // 할당 후 검증
+      clicked_points[current_platform_index].clear();
+      clicked_points[current_platform_index].reserve(4);
+      clicked_points[current_platform_index] = temp_points;
+
       if (clicked_points[current_platform_index].size() != 4) {
         std::cout << "Error: Failed to assign points to platform " << current_platform_index << std::endl;
         temp_points.clear();
         return;
       }
-      
+
       std::cout << "Platform " << current_platform_index << " selected successfully.\n";
       std::cout << "  Points: (" << temp_points[0].x << "," << temp_points[0].y << ") "
                 << "(" << temp_points[1].x << "," << temp_points[1].y << ") "
                 << "(" << temp_points[2].x << "," << temp_points[2].y << ") "
                 << "(" << temp_points[3].x << "," << temp_points[3].y << ")\n";
-      std::cout << "  Stored points count: " << clicked_points[current_platform_index].size() << std::endl;
-      
+
       current_platform_index++;
       temp_points.clear();
     } else {
@@ -116,43 +112,89 @@ void onMouseClick(int event, int x, int y, int flags, void* userdata) {
   }
 }
 
+
 void wait_for_user_clicks(cv::VideoCapture& cap) {
     cv::Mat frame;
-    // 첫 프레임만 읽어서 저장
     cap >> frame;
-    if (frame.empty()) return;
+    cap.release();  // ✅ 첫 프레임 캡처 후 비디오 객체 해제
+    if (frame.empty()) {
+        std::cerr << "❌ 첫 프레임을 불러오지 못했습니다.\n";
+        return;
+    }
 
     cv::namedWindow("Select Platforms", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Select Platforms", 800, 600);
+    cv::resizeWindow("Select Platforms", 1280, 960);
     cv::setMouseCallback("Select Platforms", onMouseClick, nullptr);
 
     std::cout << "💡 Tip: Select 4 points in clockwise order (top-left, top-right, bottom-right, bottom-left)\n";
 
+    cv::Mat final_display;
+
+    // 사용자 입력 반복
     while (!ready_to_start) {
         cv::Mat display = frame.clone();
 
-        // 현재 선택 중인 플랫폼 정보 표시
         std::string status_text = "Platform " + std::to_string(current_platform_index) +
-                                 " (" + std::to_string(temp_points.size()) + "/4 points)";
-        cv::putText(display, status_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+                                  " (" + std::to_string(temp_points.size()) + "/4 points)";
+        cv::putText(display, status_text, cv::Point(30, 60), cv::FONT_HERSHEY_SIMPLEX,
+                    3.0, cv::Scalar(0, 255, 128), 6);
 
-        // 이미 선택한 플랫폼 그리기
+        // 기존 선택된 플랫폼 그리기
         for (int i = 0; i < current_platform_index; ++i) {
-            auto& pts = clicked_points[i];
+            const auto& pts = clicked_points[i];
             for (int j = 0; j < 4; ++j)
-                cv::line(display, pts[j], pts[(j + 1) % 4], cv::Scalar(255, 10*i, 0), 2);
+                cv::line(display, pts[j], pts[(j + 1) % 4], cv::Scalar(0, 255, 128), 16);
+            for (int j = 0; j < 4; ++j)
+                cv::circle(display, pts[j], 20, cv::Scalar(0, 255, 128), -1);
         }
 
-        // 현재 선택 중인 점 표시
+        // 현재 선택 중인 점
         for (const auto& pt : temp_points)
-            cv::circle(display, pt, 5, cv::Scalar(0, 255, 0), -1);
+            cv::circle(display, pt, 20, cv::Scalar(0, 255, 128), -1);
 
+        // 4개 점 모두 선택되었을 경우 임시 사각형 표시
+        if (temp_points.size() == 4) {
+            for (int j = 0; j < 4; ++j)
+                cv::line(display, temp_points[j], temp_points[(j + 1) % 4], cv::Scalar(0, 255, 128), 16);
+        }
+
+        final_display = display.clone();  // 저장용 복사
         cv::imshow("Select Platforms", display);
-        if (cv::waitKey(30) == 27) break;  // ESC 누르면 종료
+
+        if (cv::waitKey(30) == 27) break;  // ESC 키 누르면 강제 종료
+    }
+
+    // 마지막 temp_points를 platform에 반영
+    if (ready_to_start && temp_points.size() == 4) {
+        clicked_points.push_back(temp_points);
+        ++current_platform_index;
+    }
+
+    // 최종 결과 이미지 작성 및 저장
+    if (!frame.empty()) {
+        final_display = frame.clone();
+
+        std::string final_text = "Final Platform Selections: " + std::to_string(current_platform_index);
+        cv::putText(final_display, final_text, cv::Point(30, 60), cv::FONT_HERSHEY_SIMPLEX,
+                    3.0, cv::Scalar(0, 255, 128), 6);
+
+        for (const auto& pts : clicked_points) {
+            for (int j = 0; j < 4; ++j)
+                cv::line(final_display, pts[j], pts[(j + 1) % 4], cv::Scalar(0, 255, 128), 16);
+            for (int j = 0; j < 4; ++j)
+                cv::circle(final_display, pts[j], 20, cv::Scalar(0, 255, 128), -1);
+        }
+
+        std::string filename = "img/selected_platforms_final.jpg";
+        cv::imwrite(filename, final_display);
+        std::cout << "✅ 최종 플랫폼 선택 이미지를 저장했습니다: " << filename << std::endl;
     }
 
     cv::destroyWindow("Select Platforms");
 }
+
+
+
 
 /*end debuging */
 
