@@ -33,6 +33,7 @@ void auto_brightness_balance(cv::Mat &bgr_image, cv::Mat &dst_image) {
   cv::cvtColor(lab, dst_image, cv::COLOR_Lab2BGR);
 }
 
+
 void warp_rectified_areas(cv::Mat &bgr_image, std::vector<cv::Mat> &dst_image,
                          std::vector<std::vector<cv::Point>> &rect) {
 
@@ -81,7 +82,7 @@ void warp_rectified_areas(cv::Mat &bgr_image, std::vector<cv::Mat> &dst_image,
                                  width_and_height_vec[r_index].second));
 
     dst_image[r_index] = result;
-    std::cout << "Platform " << r_index << " warped: " << result.cols << "x" << result.rows << std::endl;
+    //std::cout << "Platform " << r_index << " warped: " << result.cols << "x" << result.rows << std::endl;
   }
 }
 
@@ -128,7 +129,7 @@ void remove_achromatic_area(cv::Mat &bgrImage, cv::Mat &dst_mask,
       if (!is_achromatic(bgr, threshold_ach)) {
         mask_row[x] = 255;
       } else {
-        int brightness = bgr[0] + bgr[1] + bgr[2];
+        int brightness = static_cast<int>(0.114 * bgr[0] + 0.587 * bgr[1] + 0.299 * bgr[2]);
         ach_points_vec[index].push_back({cv::Point(x, y), brightness});
         ach_brightness_vec[index].push_back(brightness);
       }
@@ -136,6 +137,26 @@ void remove_achromatic_area(cv::Mat &bgrImage, cv::Mat &dst_mask,
   }
 }
 
+bool is_achromatic(const cv::Vec3b &bgr, float threshold) {
+  float sum = bgr[0] + bgr[1] + bgr[2];
+  if (sum == 0) return true;
+
+  float b_ratio = static_cast<float>(bgr[0]) / sum;
+  float g_ratio = static_cast<float>(bgr[1]) / sum;
+  float r_ratio = static_cast<float>(bgr[2]) / sum;
+
+  float max_val = std::max({b_ratio, g_ratio, r_ratio});
+  float min_val = std::min({b_ratio, g_ratio, r_ratio});
+
+  // 파란색 성분이 가장 높다면 threshold를 관대하게
+  float adaptive_threshold = (b_ratio > r_ratio && b_ratio > g_ratio)
+                                 ? threshold * 0.8f  // 또는 +0.05f 등으로 조정
+                                 : threshold;
+
+  return (max_val - min_val) < adaptive_threshold;
+}
+
+/*
 bool is_achromatic(const cv::Vec3b &bgr, float threshold) {
   float sum, b_ratio, g_ratio, r_ratio, max_val, min_val;
 
@@ -151,7 +172,7 @@ bool is_achromatic(const cv::Vec3b &bgr, float threshold) {
 
   return (max_val - min_val) < threshold;
 }
-
+*/
 void revive_white_areas(std::vector<cv::Mat> &bgrImages, std::vector<cv::Mat> &dst_masks, 
     int threshold_br){
         if(bgrImages.empty()||dst_masks.empty()||
