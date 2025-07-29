@@ -8,6 +8,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 # OpenCV 찾기
 find_package(OpenCV REQUIRED)
 
+# X11 라이브러리 찾기
+find_package(X11 REQUIRED)
+
 # pkg-config 사용하여 libcamera 설정 (주석 해제 및 실제 사용)
 find_package(PkgConfig REQUIRED)
 #pkg_check_modules(LIBCAMERA REQUIRED libcamera)
@@ -28,12 +31,14 @@ add_executable(station_checker
 target_include_directories(station_checker PRIVATE
     ${OpenCV_INCLUDE_DIRS}
 #    ${LIBCAMERA_INCLUDE_DIRS}
+    ${X11_INCLUDE_DIR}
 )
 
 # 라이브러리 링크
 target_link_libraries(station_checker PRIVATE
     ${OpenCV_LIBS}
     ${LIBCAMERA_LIBRARIES}
+    ${X11_LIBRARIES}
     pthread      # POSIX 쓰레드를 사용하는 경우
     rt                  # 공유 메모리 함수용 librt
     X11
