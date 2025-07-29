@@ -26,12 +26,18 @@ const char cap_name[] = "final.mp4";
 //   ! " "videoconvert ! appsink";
 bool is_capture_thread_running = true;
 
-static std::vector<cv::Scalar> notch_target = {
+/*static std::vector<cv::Scalar> notch_target = {
     cv::Scalar(0, 15, 110),    // 아스팔트
     cv::Scalar(0, 20, 150),    //정류장 기둥
     cv::Scalar(100, 25, 170),  // 정류장 유리
     cv::Scalar(0, 10, 200)     // 인도 블록
+};*/
+
+static std::vector<cv::Scalar> notch_target = {
+    cv::Scalar(105, 131, 70),  // 아스팔트
+    cv::Scalar(18, 80, 210)    // 도로 밝은 부분
 };
+
 static std::vector<std::vector<cv::Point>> clicked_points(PLATFORM_SIZE);
 static ThreadSafeQueue<std::shared_ptr<cv::Mat>> frame_queue;
 static ThreadSafeQueue<std::shared_ptr<std::vector<cv::Mat>>> warped_queue;

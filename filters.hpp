@@ -25,7 +25,7 @@ void revive_white_area(cv::Mat &src_mask, cv::Mat &dst_mask, int index,
 void batchApplyNotchFilterHSVtoAll(
     const std::vector<cv::Mat> &inputImages, std::vector<cv::Mat> &outputImages,
     const std::vector<cv::Scalar> &targetColorsHSV, int hueTolerance = 25,
-    int satTolerance = 50, int valTolerance = 40);
+    int satTolerance = 40, int valTolerance = 80);
 
 void notchFilterByColorsHSV(const cv::Mat &inputImage, cv::Mat &outputImage,
                             const std::vector<cv::Scalar> &targetColorsHSV,

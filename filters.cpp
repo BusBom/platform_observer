@@ -182,6 +182,7 @@ bool is_achromatic(const cv::Vec3b &bgr, float threshold) {
   return (max_val - min_val) < threshold;
 }
 */
+
 void revive_white_areas(std::vector<cv::Mat> &bgrImages,
                         std::vector<cv::Mat> &dst_masks, int threshold_br) {
   if (bgrImages.empty() || dst_masks.empty() ||
@@ -256,7 +257,16 @@ void notchFilterByColorsHSV(const cv::Mat &inputImage, cv::Mat &outputImage,
   }
 
   // [4] 마스크 영역 제거
-  outputImage.setTo(cv::Scalar(0, 0, 0), mask);
+  // outputImage.setTo(cv::Scalar(0, 0, 0), mask);
+  for (int y = 0; y < outputImage.rows; ++y) {
+    for (int x = 0; x < outputImage.cols; ++x) {
+      if (mask.at<uchar>(y, x) != 0) {
+        cv::Vec3b &pixel = outputImage.at<cv::Vec3b>(y, x);
+        uchar avg = static_cast<uchar>((pixel[0] + pixel[1] + pixel[2]) / 3);
+        pixel = cv::Vec3b(avg * 0.5f, avg * 0.5f, avg * 0.5f);
+      }
+    }
+  }
 }
 
 void batchApplyNotchFilterHSVtoAll(
