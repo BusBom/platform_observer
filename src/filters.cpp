@@ -156,37 +156,94 @@ bool is_achromatic(const cv::Vec3b &bgr, float threshold) {
     return (max_val - min_val) < threshold;
 }
 
-void revive_white_areas(std::vector<cv::Mat> &bgrImages, std::vector<cv::Mat> &dst_masks, 
-    int threshold_br){
-        if(bgrImages.empty()||dst_masks.empty()||
-            bgrImages.size()!=dst_masks.size()) {
-                return;
-            }
+void generate_blue_mask(const cv::Mat& bgrImage, cv::Mat& blue_mask) {
+    cv::Mat hsv;
+    cv::cvtColor(bgrImage, hsv, cv::COLOR_BGR2HSV);
+    // 파란색 범위: Hue 100~130
+    cv::inRange(hsv, cv::Scalar(95, 100, 30), cv::Scalar(125, 255, 230), blue_mask);
+}
 
-        for(int i_index = 0; i_index < bgrImages.size(); i_index++){
-            revive_white_area(bgrImages[i_index], dst_masks[i_index], i_index, threshold_br);
-        }
+// 2. 밝은 흰색 마스크 생성 함수 (새로 추가)
+void generate_white_mask(const cv::Mat& bgrImage, cv::Mat& white_mask) {
+    cv::Mat gray;
+    cv::cvtColor(bgrImage, gray, cv::COLOR_BGR2GRAY);
+    // 매우 밝은 영역만 흰색으로 추출 (임계값 220, 조정 가능)
+    cv::threshold(gray, white_mask, 210, 255, cv::THRESH_BINARY);
+}
+
+// 3. 두 마스크를 결합하는 메인 필터 함수
+void generate_combined_bus_mask(const std::vector<cv::Mat>& bgrImages, std::vector<cv::Mat>& final_masks) {
+    final_masks.resize(bgrImages.size());
+
+    for (size_t i = 0; i < bgrImages.size(); ++i) {
+        cv::Mat blue_mask, white_mask;
+
+        // 각 트랙을 실행하여 마스크 생성
+        generate_blue_mask(bgrImages[i], blue_mask);
+        generate_white_mask(bgrImages[i], white_mask);
+
+        // 비트 OR 연산으로 두 마스크를 합침
+        cv::bitwise_or(blue_mask, white_mask, final_masks[i]);
     }
+}
 
-void revive_white_area(cv::Mat &src_mask, cv::Mat &dst_mask, 
-    int index, int threshold_br) {
+void generate_bus_mask(const std::vector<cv::Mat> &bgrImages, std::vector<cv::Mat> &final_masks,
+                                               float ach_threshold, int brightness_rank) {
+    final_masks.resize(bgrImages.size());
 
-    if (ach_points_vec[index].empty()) return;
+    for (size_t idx = 0; idx < bgrImages.size(); ++idx) {
+        const cv::Mat &img = bgrImages[idx];
+        cv::Mat hsv, blue_mask, white_mask, gray;
 
-    dst_mask = src_mask;
+        // [1] 블루 마스크
+        cv::cvtColor(img, hsv, cv::COLOR_BGR2HSV);
+        cv::inRange(hsv, cv::Scalar(95, 120, 80), cv::Scalar(125, 255, 255), blue_mask);
 
-    std::sort(ach_brightness_vec[index].begin(), ach_brightness_vec[index].end());
-    ach_brightness_vec[index].erase(
-        std::unique(ach_brightness_vec[index].begin(), ach_brightness_vec[index].end()),
-        ach_brightness_vec[index].end());
-    int idx = std::clamp((int)(threshold_br / 100.f * ach_brightness_vec[index].size()), 0,
-                        (int)(ach_brightness_vec[index].size() - 1));
+        // [2] 밝은 무채색 마스크
+        std::vector<int> brightness_values;
+        std::vector<cv::Point> bright_points;
 
-    int dynamic_br_threshold = ach_brightness_vec[index][idx];
+        white_mask = cv::Mat::zeros(img.size(), CV_8UC1);
 
-    for (auto &[pt, brightness] : ach_points_vec[index]) {
-        if (brightness > dynamic_br_threshold) {
-            dst_mask.at<uchar>(pt) = 255;
+        for (int y = 0; y < img.rows; ++y) {
+            const cv::Vec3b *row = img.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < img.cols; ++x) {
+                const cv::Vec3b &bgr = row[x];
+                float sum = bgr[0] + bgr[1] + bgr[2];
+                if (sum == 0) continue;
+
+                float b_ratio = (float)bgr[0] / sum;
+                float g_ratio = (float)bgr[1] / sum;
+                float r_ratio = (float)bgr[2] / sum;
+                float max_v = std::max({b_ratio, g_ratio, r_ratio});
+                float min_v = std::min({b_ratio, g_ratio, r_ratio});
+
+                if ((max_v - min_v) < ach_threshold) {
+                    int brightness = bgr[0] + bgr[1] + bgr[2];
+                    brightness_values.push_back(brightness);
+                    bright_points.push_back(cv::Point(x, y));
+                }
+            }
         }
+
+        // 밝기 기준 상위 N%만 선택
+        if (!brightness_values.empty()) {
+            std::sort(brightness_values.begin(), brightness_values.end());
+            brightness_values.erase(std::unique(brightness_values.begin(), brightness_values.end()), brightness_values.end());
+
+            int rank_idx = std::clamp(static_cast<int>((brightness_rank / 100.0f) * brightness_values.size()), 0, (int)brightness_values.size() - 1);
+            int bright_thresh = brightness_values[rank_idx];
+
+            for (size_t i = 0; i < bright_points.size(); ++i) {
+                if ((bgrImages[idx].at<cv::Vec3b>(bright_points[i])[0] +
+                     bgrImages[idx].at<cv::Vec3b>(bright_points[i])[1] +
+                     bgrImages[idx].at<cv::Vec3b>(bright_points[i])[2]) > bright_thresh) {
+                    white_mask.at<uchar>(bright_points[i]) = 255;
+                }
+            }
+        }
+
+        // [3] 최종 OR
+        cv::bitwise_or(blue_mask, white_mask, final_masks[idx]);
     }
 }

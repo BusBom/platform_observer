@@ -1,5 +1,10 @@
 opencv 4.xx
 
+// roi_picker 컴파일
+g++ roi_picker.cpp -o roi_picker `pkg-config --cflags --libs opencv4`
+./roi_picker
+
+
 // 버스 아래쪽 좌표
 {
 	"stop_rois": [
