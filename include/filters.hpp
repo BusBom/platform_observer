@@ -24,5 +24,5 @@ void generate_combined_bus_mask(const std::vector<cv::Mat>& bgrImages, std::vect
 void generate_bus_mask(const std::vector<cv::Mat> &bgrImages,
                                                std::vector<cv::Mat> &final_masks,
                                                float ach_threshold = 0.1,
-                                               int brightness_rank = 80);
+                                               int brightness_rank = 75);
 #endif

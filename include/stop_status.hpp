@@ -15,6 +15,6 @@
  */
 struct StopStatus {
     int platform_status[MAX_PLATFORM_COUNT];  // 플랫폼 상태: -1(미사용), 0(비어있음), 1(정차)
-    char station_id[16];                      // 정류장 고유 ID (예: "S001"), 확장성 고려
+    char station_id[16];                      // 정류장 고유 ID
     time_t updated_at;                        // 마지막 상태 갱신 시각 (time(nullptr))
 };
