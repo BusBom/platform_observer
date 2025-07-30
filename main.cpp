@@ -3,7 +3,7 @@
  * @brief 유닉스 도메인 소켓으로 ROI 설정과 영상 스트림을 받아 버스를 감지하고,
  *        정제된 감지 결과를 공유 메모리에 기록하는 메인 프로그램
  */
-#include <chrono> //warp 되는 것까지 확인함, 화면 디버깅 지우고, 다음 단계로 넘어갈 것
+#include <chrono>
 #include <iostream>
 #include <thread>
 #include <atomic>
@@ -41,8 +41,17 @@
 // --- 전역 설정 ---
 const int TARGET_FPS = 15;
 const std::chrono::milliseconds FRAME_DURATION(1000 / TARGET_FPS);
-const char* STATION_ID = "S001";    // 정류장 ID, 추후 확장 가능
-const int STABLE_THRESHOLD = 20;     // 정차로 판단하기 위한 연속 감지 프레임 수 ( 30 = 2초 )
+const char* STATION_ID = "101000004";    // 정류장 ID
+
+// --- 상태 안정화(Debouncing)용 변수 ---
+static int stable_status[MAX_PLATFORM_COUNT] = {0};
+static int prev_stable_status[MAX_PLATFORM_COUNT] = {0};
+
+// --- 시간 기반 정차 판단용 변수 ---
+static std::chrono::steady_clock::time_point detection_start_time[MAX_PLATFORM_COUNT];
+static int detection_loss_counter[MAX_PLATFORM_COUNT] = {0}; // 감지 손실 카운터
+const double STABLE_TIME_THRESHOLD_S = 3.0;     // 정차로 판단하기 위한 시간 (초)
+const int LOSS_TOLERANCE_CYCLES = 5;            // 감지 손실 허용 횟수 (사이클)
 
 // --- 전역 변수 ---
 unsigned int PLATFORM_SIZE = 0;
@@ -57,11 +66,6 @@ std::atomic<bool> is_config_ready(false);           // ROI 설정 완료 여부 
 int status_shm_fd = -1;
 StopStatus* status_shm_ptr = nullptr;
 
-// --- 상태 안정화(Debouncing)용 변수 ---
-static int detect_counter[MAX_PLATFORM_COUNT] = {0};
-static int stable_status[MAX_PLATFORM_COUNT] = {0};
-static int miss_counter[MAX_PLATFORM_COUNT] = {0};
-
 // --- 데이터 큐 ---
 static ThreadSafeQueue<std::shared_ptr<cv::Mat>> frame_queue;
 static ThreadSafeQueue<std::shared_ptr<std::vector<cv::Mat>>> warped_queue;
@@ -73,12 +77,6 @@ unsigned int total_frame = 0;
 unsigned int frame_wasted = 0;
 unsigned int warped_wasted = 0;
 unsigned int masked_wasted = 0;
-
-/** 현재 조정 상황 (filters.cpp 참고)
-* 유채색 vs 무채색 : 0.15
-* 영역 내 흰색 판단 : 70 (상위 30%)
-* 버스 또는 물체 유무 판단 : 0.4
-*/
 
 void initialize_platform_status(unsigned int platform_count);
 void process_bus_status(unsigned int platform_count, const bool* raw_status);
@@ -109,7 +107,7 @@ void receive_roi_config_thread() {
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("bind failed"); close(server_fd); return;
     }
-    // 소켓 파일의 권한을 777로 변경하여 모든 사용자가 접근 가능하도록 함
+
     if (chmod(SOCKET_PATH, 0777) < 0) {
         perror("chmod failed");
         close(server_fd);
@@ -143,7 +141,7 @@ void receive_roi_config_thread() {
                 break;
             }
             
-            std::cout << "🤝 CGI client connected. Receiving ROI data..." << std::endl;
+            std::cout << "CGI client connected. Receiving ROI data..." << std::endl;
 
             std::vector<char> buffer;
             char temp_buf[4096];
@@ -324,8 +322,11 @@ void initialize_platform_status(unsigned int platform_count) {
     if (status_shm_ptr == nullptr) return;
 
     for (unsigned int i = 0; i < MAX_PLATFORM_COUNT; ++i) {
-        detect_counter[i] = 0;
         stable_status[i] = 0;
+        prev_stable_status[i] = 0;
+        detection_start_time[i] = std::chrono::steady_clock::time_point(); // 시간 기록 초기화
+        detection_loss_counter[i] = 0;
+
         if (i < platform_count) {
             status_shm_ptr->platform_status[i] = 0; // 사용 플랫폼은 0(empty)으로 초기화
         } else {
@@ -341,21 +342,33 @@ void initialize_platform_status(unsigned int platform_count) {
  */
 void process_bus_status(unsigned int platform_count, const bool* raw_status) {
     for (unsigned int i = 0; i < platform_count; ++i) {
-        if (raw_status[i]) {            // 버스가 감지되면
-            miss_counter[i] = 0;        //실패 카운터 초기화
-            if(detect_counter[i] < STABLE_THRESHOLD) {
-                detect_counter[i]++;
-            }
-            if (detect_counter[i] >= STABLE_THRESHOLD) {
-                stable_status[i] = 1;   // 상태를 1(정차)로 변경
-            }
-        } else { 
-            miss_counter[i]++;
-            if(miss_counter[i] >= 3) {  // 3프레임 이상 연속 감지 실패 시 감지 카운터 초기화
-                detect_counter[i] = 0; 
-                stable_status[i] = 0; 
-            }
+        if (raw_status[i]) { // 버스가 감지된 경우
+            // 이전에 정차 상태가 아니었을 때 (새로 감지 시작)
+            if (stable_status[i] == 0) {
+                // 감지 시작 시간을 기록한 적이 없다면, 현재 시간을 기록
+                if (detection_start_time[i].time_since_epoch().count() == 0) {
+                    detection_start_time[i] = std::chrono::steady_clock::now();
+                }
 
+                // 경과 시간 계산
+                auto elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(
+                    std::chrono::steady_clock::now() - detection_start_time[i]
+                );
+
+                // 경과 시간이 임계값을 넘으면 정차로 확정
+                if (elapsed_time.count() >= STABLE_TIME_THRESHOLD_S) {
+                    stable_status[i] = 1;
+                }
+            }
+        } else { // 버스가 감지되지 않은 경우
+            detection_loss_counter[i]++;
+
+            // 허용된 손실 횟수를 초과하면, 모든 상태를 완전히 리셋
+            if (detection_loss_counter[i] > LOSS_TOLERANCE_CYCLES) {
+                stable_status[i] = 0;
+                detection_start_time[i] = std::chrono::steady_clock::time_point();
+            }
+            // 허용치 이내라면, 아무것도 하지 않고 타이머를 유지 (다음 감지를 기다림)
         }
     }
 }
@@ -436,14 +449,12 @@ void mask_thread() {
             warped_wasted++;
         }
 
+        // 파란색 마스크 + 동적 흰색 마스크
         if (warped_queue.try_pop(frame)) {
-            std::vector<cv::Mat> masked_1(local_platform_size), masked_2(local_platform_size);
-            remove_achromatic_areas((*frame), masked_1);
-            revive_white_areas(masked_1, masked_2);
-            masked_queue.push(std::make_shared<std::vector<cv::Mat>>(std::move(masked_2)));
-        } 
-
-
+            std::vector<cv::Mat> final_masks;
+            generate_bus_mask(*frame, final_masks);
+            masked_queue.push(std::make_shared<std::vector<cv::Mat>>(std::move(final_masks)));
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
@@ -451,10 +462,7 @@ void mask_thread() {
 /**
  * @brief 영상 파일에서 프레임을 읽어와 큐에 넣는 스레드 함수
  */
-void video_read_thread(const std::string& video_filename) {
-    const std::string base_path = "file://home/Qwd/platform_observer/video/";
-    std::string video_path = base_path + video_filename;
-
+void video_read_thread(const std::string& video_path) {
     cv::VideoCapture cap(video_path);
     if (!cap.isOpened()) {
         std::cerr << "Failed to open viedo file: " << video_path << std::endl;
@@ -499,9 +507,6 @@ void video_read_thread(const std::string& video_filename) {
         total_frame++;
         frame_queue.push(std::make_shared<cv::Mat>(std::move(balanced)));
 
-        // frame_queue.push(std::make_shared<cv::Mat>(std::move(resized)));
-        // total_frame++;
-
         auto elapsed = std::chrono::high_resolution_clock::now() - start;
         auto sleep_time = FRAME_DURATION - std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
         if (sleep_time > std::chrono::milliseconds(0)) {
@@ -530,7 +535,7 @@ int main(int argc, char *argv[]) {
     if (argc > 1) {
         // 인자로 영상 파일 경로가 주어지면 비디오 파일 모드로 실행
         std::cout << "Starting in video file mode with: " << argv[1] << std::endl;
-        reader_thread = std::thread(video_read_thread, std::string(argv[1]));
+        reader_thread = std::thread(video_read_thread, "file://home/Qwd/platform_observer/video/" + std::string(argv[1]));
     } else {
         // 인자가 없으면 기본값인 공유 메모리 모드로 실행
         std::cout << "Starting in shared memory mode." << std::endl;
@@ -545,8 +550,9 @@ int main(int argc, char *argv[]) {
     std::cout << "✅ Main process running. Waiting for initial CGI configuration via socket..." << std::endl;
 
     // ---- debug: 변수 선언 ----
-    cv::Mat last_raw_frame_with_rois;
     std::vector<cv::Mat> last_masked_frames;
+    cv::namedWindow("Debug View");
+    cv::moveWindow("Debug View", 600, 280); // 마스크 창들 옆에 위치
     // -------------------------
 
     while (running.load()) {
@@ -568,33 +574,37 @@ int main(int argc, char *argv[]) {
         if (is_config_ready.load()) {
             std::shared_ptr<std::vector<cv::Mat>> masked;
             if (masked_queue.try_pop(masked)) {
-                // 1. 감지 결과 확인
                 check_bus_platform(*masked, BUS_PLATFORM_STATUS);
-
-                // 2. 감지 결과 안정화
                 process_bus_status(PLATFORM_SIZE, BUS_PLATFORM_STATUS);
-
-                // 3. 안정화된 결과를 공유 메모리에 업데이트
                 update_shared_status(PLATFORM_SIZE);
                 
                 // 콘솔 디버그 출력
                 std::cout << "--- Platform Status Updated (Stable) ---" << std::endl;
                 for (unsigned int i = 0; i < PLATFORM_SIZE; i++) {
-                    std::cout << "  Platform " << i << ": " << (stable_status[i] ? "BUS DETECTED" : "Empty")
-                              << " (Counter: " << detect_counter[i] << ")" << std::endl;
+                    std::cout << "  Platform " << i << ": " << (stable_status[i] ? "BUS DETECTED" : "Empty") << std::endl;
                 }
                 last_masked_frames = *masked;
             }
+        }
 
-            // ---- debug: mask 확인용 ----
+        // Debug: 각 플랫폼의 마스크 창
+        if (!last_masked_frames.empty()) {
+            int base_x = 520;
+            int current_y = 280;
+            int padding = 40;  
+
             for (size_t i = 0; i < last_masked_frames.size(); ++i) {
-                if (!last_masked_frames[i].empty()) {
-                    std::string win_name = "Debug View - Platform " + std::to_string(i);
+               if (!last_masked_frames[i].empty()) {
+                    std::string win_name = "Platform Mask " + std::to_string(i);
                     cv::imshow(win_name, last_masked_frames[i]);
+                    cv::moveWindow(win_name, base_x, current_y);
+                    current_y += last_masked_frames[i].rows + padding;
                 }
             }
-            // ---------------------------
-            cv::waitKey(1);
+        }
+
+        if (cv::waitKey(1) == 'q') {
+            running = false;
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(10)); // CPU 과점유 방지용
