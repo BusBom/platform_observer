@@ -50,7 +50,7 @@ static int prev_stable_status[MAX_PLATFORM_COUNT] = {0};
 // --- 시간 기반 정차 판단용 변수 ---
 static std::chrono::steady_clock::time_point detection_start_time[MAX_PLATFORM_COUNT];
 static int detection_loss_counter[MAX_PLATFORM_COUNT] = {0}; // 감지 손실 카운터
-const double STABLE_TIME_THRESHOLD_S = 3.0;     // 정차로 판단하기 위한 시간 (초)
+const double STABLE_TIME_THRESHOLD_S = 3.5;     // 정차로 판단하기 위한 시간 (초)
 const int LOSS_TOLERANCE_CYCLES = 5;            // 감지 손실 허용 횟수 (사이클)
 
 // --- 전역 변수 ---
