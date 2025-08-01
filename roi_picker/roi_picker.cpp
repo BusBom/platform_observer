@@ -76,7 +76,7 @@ void draw_hud(cv::Mat& img) {
 }
 
 int main() {
-    std::string video_path = "video/2nd_color_graded.mp4";
+    std::string video_path = "video/2nd_color_graded_15fps.mp4";
     cap.open(video_path);
     if (!cap.isOpened()) {
         std::cerr << "❌ 영상 열기 실패: " << video_path << std::endl;

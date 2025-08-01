@@ -66,7 +66,7 @@ static bool prev_entry_gate_status = false;
 static bool prev_exit_gate_status = false;
 static int entry_gate_loss_counter = 0;
 static int exit_gate_loss_counter = 0;
-const int GATE_LOSS_TOLERANCE_CYCLES = 3;  // 게이트 감지 손실 허용 횟수
+const int GATE_LOSS_TOLERANCE_CYCLES = 5;  // 게이트 감지 손실 허용 횟수
 
 // --- 입구/출구 영역 상태 추적용 변수 ---
 static bool entry_area_filled = false;
@@ -76,17 +76,29 @@ static bool prev_exit_area_filled = false;
 
 // --- 출구 영역 안정화를 위한 변수 ---
 static int exit_detection_counter = 0;
-static const int EXIT_DETECTION_THRESHOLD = 3;  // 연속 3회 감지되면 출구로 인식
+static const int EXIT_DETECTION_THRESHOLD = 5;  // 연속 3회 감지되면 출구로 인식
 
 // --- 입구 영역 안정화를 위한 변수 ---
 static int entry_detection_counter = 0;
-static const int ENTRY_DETECTION_THRESHOLD = 5;  // 연속 5회 감지되면 입구로 인식 (더 엄격)
+static const int ENTRY_DETECTION_THRESHOLD = 8;  // 연속 5회 감지되면 입구로 인식 (더 엄격)
+
+// --- 단일 게이트 중복 방지를 위한 변수 ---
+static std::chrono::steady_clock::time_point last_entry_gate_detection_time;
+static std::chrono::steady_clock::time_point last_exit_gate_detection_time;
+static const double ENTRY_GATE_COOLDOWN_TIME = 8.0;  // 진입 게이트 쿨다운 시간 (초)
+static const double EXIT_GATE_COOLDOWN_TIME = 3.0;   // 진출 게이트 쿨다운 시간 (초)
+
+// --- 진출 게이트 픽셀 비율 추적 변수 ---
+static double exit_gate_max_ratio = 0.0;  // 진출 게이트 최대 픽셀 비율
+static double exit_gate_min_ratio = 1.0;  // 진출 게이트 최소 픽셀 비율
+static bool exit_gate_ratio_initialized = false;  // 진출 게이트 비율 초기화 여부
 
 // --- 전역 변수 ---
 unsigned int PLATFORM_SIZE = 0;
 std::vector<std::vector<cv::Point>> platform_rois;
 bool BUS_PLATFORM_STATUS[MAX_PLATFORM_COUNT] = {false};
 std::mutex rois_mutex;
+bool debug_mode = false;  // 디버그 모드 플래그
 
 std::atomic<bool> running(true);
 std::atomic<bool> is_config_ready(false);  // ROI 설정 완료 여부 플래그
@@ -121,14 +133,15 @@ const double EXIT_DELAY_SEC = 2.5;
 // [추가] 연속 감지 방지를 위한 변수
 std::chrono::steady_clock::time_point last_entry_counted;
 std::chrono::steady_clock::time_point last_exit_counted;
-const double MIN_ENTRY_INTERVAL_SEC = 10.0;  // 최소 진입 간격 (초) - 늘림
-const double MIN_EXIT_INTERVAL_SEC = 3.0;   // 최소 진출 간격 (초)
+const double MIN_ENTRY_INTERVAL_SEC = 2.0;  // 최소 진입 간격 (초) - 완화
+const double MIN_EXIT_INTERVAL_SEC = 1.0;   // 최소 진출 간격 (초) - 완화
 
 // [추가] 정류장 내 추정 버스 수
 int estimated_bus_in_station = 0;
 
 void update_bus_count_by_entry_exit(unsigned int platform_count, const bool* raw_status);
 void initialize_platform_status(unsigned int platform_count);
+void reset_platform_status(unsigned int platform_count);  // 카운터 리셋용
 void set_initial_bus_count(unsigned int platform_count, const bool* raw_status);
 void correct_bus_count_if_needed(unsigned int platform_count, const bool* raw_status);
 void reset_bus_count_to_platform_status(unsigned int platform_count, const bool* raw_status);
@@ -368,7 +381,7 @@ void shm_read_thread() {
  */
 bool setup_status_shm() {
   umask(0);
-  status_shm_fd = shm_open(SHM_NAME_STATUS, O_CREAT | O_RDWR, 0666);
+  status_shm_fd = shm_open(SHM_NAME_STATUS, O_CREAT | O_RDWR, 0777);
   if (status_shm_fd == -1) {
     perror("shm_open for status failed");
     return false;
@@ -411,12 +424,12 @@ void cleanup_status_shm() {
 }
 
 /**
- * @brief ROI 설정에 따라 플랫폼 상태 및 공유 메모리를 초기화합니다.
+ * @brief ROI 설정에 따라 플랫폼 상태 및 공유 메모리를 초기화합니다. (카운터 보존)
  */
 void initialize_platform_status(unsigned int platform_count) {
-  // 카운팅 관련 변수 초기화
-  entered_bus_count = 0;
-  exited_bus_count = 0;
+  // 카운팅 관련 변수 초기화 (ROI 설정 시에는 보존)
+  // entered_bus_count = 0;  // 보존
+  // exited_bus_count = 0;   // 보존
   prev_entry_gate_status = false;
   prev_exit_gate_status = false;
   entry_gate_loss_counter = 0;
@@ -433,6 +446,15 @@ void initialize_platform_status(unsigned int platform_count) {
   // 연속 감지 방지 변수 초기화
   last_entry_counted = std::chrono::steady_clock::time_point();
   last_exit_counted = std::chrono::steady_clock::time_point();
+  
+  // 게이트 중복 방지 변수 초기화
+  last_entry_gate_detection_time = std::chrono::steady_clock::time_point();
+  last_exit_gate_detection_time = std::chrono::steady_clock::time_point();
+  
+  // 진출 게이트 픽셀 비율 추적 변수 초기화
+  exit_gate_max_ratio = 0.0;
+  exit_gate_min_ratio = 1.0;
+  exit_gate_ratio_initialized = false;
 
   // 플랫폼 상태 초기화
   for (unsigned int i = 0; i < MAX_PLATFORM_COUNT; ++i) {
@@ -458,8 +480,72 @@ void initialize_platform_status(unsigned int platform_count) {
   }
   strncpy(status_shm_ptr->station_id, STATION_ID,
           sizeof(status_shm_ptr->station_id) - 1);
-  status_shm_ptr->entered_bus_count = 0;
-  status_shm_ptr->exited_bus_count = 0;
+  // 공유 메모리 카운터는 보존 (ROI 설정 시에는 리셋하지 않음)
+  // status_shm_ptr->entered_bus_count = 0;  // 보존
+  // status_shm_ptr->exited_bus_count = 0;   // 보존
+  status_shm_ptr->current_bus_count = 0;
+  status_shm_ptr->updated_at = time(nullptr);
+}
+
+/**
+ * @brief 플랫폼 상태 및 카운터를 완전히 리셋합니다.
+ */
+void reset_platform_status(unsigned int platform_count) {
+  // 카운팅 관련 변수 완전 초기화
+  entered_bus_count = 0;
+  exited_bus_count = 0;
+  prev_entry_gate_status = false;
+  prev_exit_gate_status = false;
+  entry_gate_loss_counter = 0;
+  exit_gate_loss_counter = 0;
+
+  // 입구/출구 영역 상태 초기화
+  entry_area_filled = false;
+  exit_area_filled = false;
+  prev_entry_area_filled = false;
+  prev_exit_area_filled = false;
+  exit_detection_counter = 0;
+  entry_detection_counter = 0;
+  
+  // 연속 감지 방지 변수 초기화
+  last_entry_counted = std::chrono::steady_clock::time_point();
+  last_exit_counted = std::chrono::steady_clock::time_point();
+  
+  // 게이트 중복 방지 변수 초기화
+  last_entry_gate_detection_time = std::chrono::steady_clock::time_point();
+  last_exit_gate_detection_time = std::chrono::steady_clock::time_point();
+  
+  // 진출 게이트 픽셀 비율 추적 변수 초기화
+  exit_gate_max_ratio = 0.0;
+  exit_gate_min_ratio = 1.0;
+  exit_gate_ratio_initialized = false;
+
+  // 플랫폼 상태 초기화
+  for (unsigned int i = 0; i < MAX_PLATFORM_COUNT; ++i) {
+    stable_status[i] = 0;
+    prev_stable_status[i] = 0;
+    detection_start_time[i] = std::chrono::steady_clock::time_point();
+    detection_loss_counter[i] = 0;
+  }
+
+  // 초기 버스 수는 별도 함수에서 설정
+  estimated_bus_in_station = 0;
+
+  if (status_shm_ptr == nullptr) return;
+
+  // 공유 메모리 완전 초기화
+  for (unsigned int i = 0; i < MAX_PLATFORM_COUNT; ++i) {
+    if (i < platform_count) {
+      status_shm_ptr->platform_status[i] =
+          0;  // 사용 플랫폼은 0(empty)으로 초기화
+    } else {
+      status_shm_ptr->platform_status[i] = -1;  // 미사용 플랫폼은 -1로 초기화
+    }
+  }
+  strncpy(status_shm_ptr->station_id, STATION_ID,
+          sizeof(status_shm_ptr->station_id) - 1);
+  status_shm_ptr->entered_bus_count = 0;  // 카운터 리셋
+  status_shm_ptr->exited_bus_count = 0;   // 카운터 리셋
   status_shm_ptr->current_bus_count = 0;
   status_shm_ptr->updated_at = time(nullptr);
 }
@@ -505,6 +591,7 @@ void process_bus_status(unsigned int stop_platform_count,
 
 /**
  * @brief 게이트의 상태를 처리하고 버스 진입/진출을 카운트합니다.
+ * 단일 게이트 내에서의 중복 감지를 방지합니다.
  */
 void process_gate_status(unsigned int total_platform_count,
                          const bool* raw_status) {
@@ -542,40 +629,79 @@ void process_gate_status(unsigned int total_platform_count,
 
   auto now = std::chrono::steady_clock::now();
   
-  // --- Rising Edge(False -> True) 감지로 카운트 ---
+  // --- 단일 게이트 중복 감지 방지 ---
+  auto time_since_last_entry_detection = std::chrono::duration_cast<std::chrono::duration<double>>(
+      now - last_entry_gate_detection_time).count();
+  auto time_since_last_exit_detection = std::chrono::duration_cast<std::chrono::duration<double>>(
+      now - last_exit_gate_detection_time).count();
+  
+  // 진입 게이트 처리
+  std::cout << "🔍 Entry Gate: prev=" << (prev_entry_gate_status ? "FILLED" : "EMPTY") 
+            << ", current=" << (current_entry_gate_status ? "FILLED" : "EMPTY") << std::endl;
+  
   if (!prev_entry_gate_status && current_entry_gate_status) {
-    // 최소 간격 확인
-    auto time_since_last_entry = std::chrono::duration_cast<std::chrono::duration<double>>(
-        now - last_entry_counted).count();
-    
-    if (time_since_last_entry >= MIN_ENTRY_INTERVAL_SEC) {
-      entered_bus_count++;  // 디버깅용 카운트
-      estimated_bus_in_station++;  // 현재 버스 수 직접 증가
-      last_entry_counted = now;
-      std::cout << "🚌 Bus entered through entry gate (gate detection) - Current: " << estimated_bus_in_station << std::endl;
+    // 진입 게이트 쿨다운 확인
+    if (time_since_last_entry_detection >= ENTRY_GATE_COOLDOWN_TIME) {
+      // 최소 간격 확인
+      auto time_since_last_entry = std::chrono::duration_cast<std::chrono::duration<double>>(
+          now - last_entry_counted).count();
+      
+      if (time_since_last_entry >= MIN_ENTRY_INTERVAL_SEC) {
+        entered_bus_count++;  // 디버깅용 카운트
+        estimated_bus_in_station++;  // 현재 버스 수 직접 증가
+        last_entry_counted = now;
+        last_entry_gate_detection_time = now;
+        std::cout << "🚌 Bus entered through entry gate - Current: " << estimated_bus_in_station << std::endl;
+      } else {
+        std::cout << "⚠️  Gate entry detection ignored (too soon: " 
+                  << std::fixed << std::setprecision(1) << time_since_last_entry 
+                  << "s < " << MIN_ENTRY_INTERVAL_SEC << "s)" << std::endl;
+      }
     } else {
-      std::cout << "⚠️  Gate entry detection ignored (too soon: " 
-                << std::fixed << std::setprecision(1) << time_since_last_entry 
-                << "s < " << MIN_ENTRY_INTERVAL_SEC << "s)" << std::endl;
+      std::cout << "⚠️  Entry gate cooldown active (" 
+                << std::fixed << std::setprecision(1) << time_since_last_entry_detection 
+                << "s < " << ENTRY_GATE_COOLDOWN_TIME << "s), ignoring" << std::endl;
     }
+  } else if (prev_entry_gate_status != current_entry_gate_status) {
+    // 게이트 상태 변화 디버그 출력
+    std::cout << "🔍 Entry gate state: " << (prev_entry_gate_status ? "FILLED" : "EMPTY") 
+              << " -> " << (current_entry_gate_status ? "FILLED" : "EMPTY") << std::endl;
   }
   
+  // 진출 게이트 처리
+  std::cout << "🔍 Exit Gate: prev=" << (prev_exit_gate_status ? "FILLED" : "EMPTY") 
+            << ", current=" << (current_exit_gate_status ? "FILLED" : "EMPTY") << std::endl;
+  
+
+  
   if (!prev_exit_gate_status && current_exit_gate_status) {
-    // 최소 간격 확인
-    auto time_since_last_exit = std::chrono::duration_cast<std::chrono::duration<double>>(
-        now - last_exit_counted).count();
-    
-    if (time_since_last_exit >= MIN_EXIT_INTERVAL_SEC) {
-      exited_bus_count++;  // 디버깅용 카운트
-      estimated_bus_in_station--;  // 현재 버스 수 직접 감소
-      if (estimated_bus_in_station < 0) estimated_bus_in_station = 0;  // 음수 방지
-      last_exit_counted = now;
-      std::cout << "🚌 Bus exited through exit gate (gate detection) - Current: " << estimated_bus_in_station << std::endl;
+    // 진출 게이트 쿨다운 확인
+    if (time_since_last_exit_detection >= EXIT_GATE_COOLDOWN_TIME) {
+      // 최소 간격 확인
+      auto time_since_last_exit = std::chrono::duration_cast<std::chrono::duration<double>>(
+          now - last_exit_counted).count();
+      
+      if (time_since_last_exit >= MIN_EXIT_INTERVAL_SEC) {
+        exited_bus_count++;  // 디버깅용 카운트
+        estimated_bus_in_station--;  // 현재 버스 수 직접 감소
+        if (estimated_bus_in_station < 0) estimated_bus_in_station = 0;  // 음수 방지
+        last_exit_counted = now;
+        last_exit_gate_detection_time = now;
+        std::cout << "🚌 Bus exited through exit gate - Current: " << estimated_bus_in_station << std::endl;
+      } else {
+        std::cout << "⚠️  Gate exit detection ignored (too soon: " 
+                  << std::fixed << std::setprecision(1) << time_since_last_exit 
+                  << "s < " << MIN_EXIT_INTERVAL_SEC << "s)" << std::endl;
+      }
     } else {
-      std::cout << "⚠️  Gate exit detection ignored (too soon: " 
-                << std::fixed << std::setprecision(1) << time_since_last_exit 
-                << "s < " << MIN_EXIT_INTERVAL_SEC << "s)" << std::endl;
+      std::cout << "⚠️  Exit gate cooldown active (" 
+                << std::fixed << std::setprecision(1) << time_since_last_exit_detection 
+                << "s < " << EXIT_GATE_COOLDOWN_TIME << "s), ignoring" << std::endl;
     }
+  } else if (prev_exit_gate_status != current_exit_gate_status) {
+    // 게이트 상태 변화 디버그 출력
+    std::cout << "🔍 Exit gate state: " << (prev_exit_gate_status ? "FILLED" : "EMPTY") 
+              << " -> " << (current_exit_gate_status ? "FILLED" : "EMPTY") << std::endl;
   }
 
   // 다음 사이클을 위해 현재 상태를 이전 상태로 저장
@@ -606,6 +732,7 @@ void set_initial_bus_count(unsigned int platform_count, const bool* raw_status) 
 
 /**
  * @brief 현재 버스 수와 실제 감지된 버스 수를 비교하여 필요시 보정합니다.
+ * 단순한 진입-진출 방식으로 변경되었으므로 보정 로직을 단순화합니다.
  */
 void correct_bus_count_if_needed(unsigned int platform_count, const bool* raw_status) {
   if (platform_count < 2) return;
@@ -626,20 +753,8 @@ void correct_bus_count_if_needed(unsigned int platform_count, const bool* raw_st
     std::cout << "  Current estimated: " << estimated_bus_in_station << std::endl;
     std::cout << "  Actually detected: " << detected_bus_count << std::endl;
     
-    // 감지된 버스 수로 보정
-    int correction = detected_bus_count - estimated_bus_in_station;
+    // 단순히 감지된 버스 수로 설정 (진입-진출 카운트는 보존)
     estimated_bus_in_station = detected_bus_count;
-    
-    // 진입/진출 카운트도 보정
-    if (correction > 0) {
-      // 더 많은 버스가 감지되었으면 진입 카운트 증가
-      entered_bus_count += correction;
-      std::cout << "  📈 Entry count adjusted by +" << correction << std::endl;
-    } else if (correction < 0) {
-      // 더 적은 버스가 감지되었으면 진출 카운트 증가
-      exited_bus_count += (-correction);
-      std::cout << "  📉 Exit count adjusted by +" << (-correction) << std::endl;
-    }
     
     std::cout << "  ✅ Bus count corrected to: " << estimated_bus_in_station << std::endl;
   }
@@ -684,6 +799,7 @@ void reset_bus_count_to_platform_status(unsigned int platform_count, const bool*
 
 /**
  * @brief 입구/출구 영역의 상태 변화를 감지하여 버스 진입/진출을 추적합니다.
+ * 안정화된 상태 변화 감지 알고리즘을 사용합니다.
  */
 void process_entry_exit_status(unsigned int total_platform_count,
                               const bool* raw_status) {
@@ -716,40 +832,62 @@ void process_entry_exit_status(unsigned int total_platform_count,
 
   auto now = std::chrono::steady_clock::now();
   
+  // --- 단일 게이트 중복 감지 방지 ---
+  auto time_since_last_entry_detection = std::chrono::duration_cast<std::chrono::duration<double>>(
+      now - last_entry_gate_detection_time).count();
+  auto time_since_last_exit_detection = std::chrono::duration_cast<std::chrono::duration<double>>(
+      now - last_exit_gate_detection_time).count();
+  
   // 출구 영역이 빈 상태였다가 안정적으로 찬 상태가 되면 버스가 나가는 것으로 인식
   if (!prev_exit_area_filled && exit_detection_counter >= EXIT_DETECTION_THRESHOLD) {
-    // 최소 간격 확인
-    auto time_since_last_exit = std::chrono::duration_cast<std::chrono::duration<double>>(
-        now - last_exit_counted).count();
-    
-    if (time_since_last_exit >= MIN_EXIT_INTERVAL_SEC) {
-      exited_bus_count++;  // 디버깅용 카운트
-      estimated_bus_in_station--;  // 현재 버스 수 직접 감소
-      if (estimated_bus_in_station < 0) estimated_bus_in_station = 0;  // 음수 방지
-      last_exit_counted = now;
-      std::cout << "🚌 Bus exited through exit gate (stable detection) - Current: " << estimated_bus_in_station << std::endl;
+    // 진출 게이트 쿨다운 확인
+    if (time_since_last_exit_detection >= EXIT_GATE_COOLDOWN_TIME) {
+      // 최소 간격 확인
+      auto time_since_last_exit = std::chrono::duration_cast<std::chrono::duration<double>>(
+          now - last_exit_counted).count();
+      
+      if (time_since_last_exit >= MIN_EXIT_INTERVAL_SEC) {
+        exited_bus_count++;  // 디버깅용 카운트
+        estimated_bus_in_station--;  // 현재 버스 수 직접 감소
+        if (estimated_bus_in_station < 0) estimated_bus_in_station = 0;  // 음수 방지
+        last_exit_counted = now;
+        last_exit_gate_detection_time = now;
+        std::cout << "🚌 Bus exited through exit gate (stable detection) - Current: " << estimated_bus_in_station << std::endl;
+      } else {
+        std::cout << "⚠️  Exit detection ignored (too soon: " 
+                  << std::fixed << std::setprecision(1) << time_since_last_exit 
+                  << "s < " << MIN_EXIT_INTERVAL_SEC << "s)" << std::endl;
+      }
     } else {
-      std::cout << "⚠️  Exit detection ignored (too soon: " 
-                << std::fixed << std::setprecision(1) << time_since_last_exit 
-                << "s < " << MIN_EXIT_INTERVAL_SEC << "s)" << std::endl;
+      std::cout << "⚠️  Exit gate cooldown active (stable: " 
+                << std::fixed << std::setprecision(1) << time_since_last_exit_detection 
+                << "s < " << EXIT_GATE_COOLDOWN_TIME << "s), ignoring" << std::endl;
     }
   }
 
   // 입구 영역이 찬 상태였다가 안정적으로 빈 상태가 되면 버스가 맨 뒤 플랫폼에 진입한 것으로 판단
   if (prev_entry_area_filled && entry_detection_counter == 0) {
-    // 최소 간격 확인
-    auto time_since_last_entry = std::chrono::duration_cast<std::chrono::duration<double>>(
-        now - last_entry_counted).count();
-    
-    if (time_since_last_entry >= MIN_ENTRY_INTERVAL_SEC) {
-      entered_bus_count++;  // 디버깅용 카운트
-      estimated_bus_in_station++;  // 현재 버스 수 직접 증가
-      last_entry_counted = now;
-      std::cout << "🚌 Bus entered through entry gate (stable detection) - Current: " << estimated_bus_in_station << std::endl;
+    // 진입 게이트 쿨다운 확인
+    if (time_since_last_entry_detection >= ENTRY_GATE_COOLDOWN_TIME) {
+      // 최소 간격 확인
+      auto time_since_last_entry = std::chrono::duration_cast<std::chrono::duration<double>>(
+          now - last_entry_counted).count();
+      
+      if (time_since_last_entry >= MIN_ENTRY_INTERVAL_SEC) {
+        entered_bus_count++;  // 디버깅용 카운트
+        estimated_bus_in_station++;  // 현재 버스 수 직접 증가
+        last_entry_counted = now;
+        last_entry_gate_detection_time = now;
+        std::cout << "🚌 Bus entered through entry gate (stable detection) - Current: " << estimated_bus_in_station << std::endl;
+      } else {
+        std::cout << "⚠️  Entry detection ignored (too soon: " 
+                  << std::fixed << std::setprecision(1) << time_since_last_entry 
+                  << "s < " << MIN_ENTRY_INTERVAL_SEC << "s)" << std::endl;
+      }
     } else {
-      std::cout << "⚠️  Entry detection ignored (too soon: " 
-                << std::fixed << std::setprecision(1) << time_since_last_entry 
-                << "s < " << MIN_ENTRY_INTERVAL_SEC << "s)" << std::endl;
+      std::cout << "⚠️  Entry gate cooldown active (stable: " 
+                << std::fixed << std::setprecision(1) << time_since_last_entry_detection 
+                << "s < " << ENTRY_GATE_COOLDOWN_TIME << "s), ignoring" << std::endl;
     }
   }
 
@@ -792,6 +930,116 @@ void process_entry_exit_status(unsigned int total_platform_count,
 }
 
 /**
+ * @brief 플랫폼 상태가 순차적으로 채워져 있는지 확인합니다.
+ * @return true: 순차적으로 채워짐 (예: 0000, 1000, 1100, 1110, 1111), false: 그렇지 않음
+ */
+bool is_platform_status_sequential(unsigned int platform_count) {
+  if (platform_count < 2) return false;
+  
+  unsigned int stop_platform_count = platform_count - 2;
+  if (stop_platform_count == 0) return true;
+  
+  // 모든 플랫폼이 비어있는 경우 (0000)
+  bool all_empty = true;
+  for (unsigned int i = 0; i < stop_platform_count; ++i) {
+    if (stable_status[i] != 0) {
+      all_empty = false;
+      break;
+    }
+  }
+  if (all_empty) return true;
+  
+  // 순차적으로 채워져 있는지 확인 (0번부터 연속으로)
+  // true: 0000, 1000, 1100, 1110, 1111
+  // false: 1001, 0110, 1010, 0101 등 (중간에 빈 플랫폼이 있거나 0번부터 시작하지 않는 경우)
+  
+  // 첫 번째로 채워진 플랫폼의 위치 찾기
+  int first_filled = -1;
+  for (unsigned int i = 0; i < stop_platform_count; ++i) {
+    if (stable_status[i] != 0) {
+      first_filled = i;
+      break;
+    }
+  }
+  
+  // 버스가 하나도 없으면 true (0000)
+  if (first_filled == -1) return true;
+  
+  // 첫 번째 버스가 0번이 아니면 false (0110, 0101 등)
+  if (first_filled != 0) return false;
+  
+  // 0번부터 연속으로 채워져 있는지 확인
+  for (unsigned int i = 0; i < stop_platform_count; ++i) {
+    if (stable_status[i] == 0) {
+      // 빈 플랫폼을 찾았으면, 그 이후로는 모두 빈 플랫폼이어야 함
+      for (unsigned int j = i + 1; j < stop_platform_count; ++j) {
+        if (stable_status[j] != 0) {
+          return false; // 중간에 빈 플랫폼이 있는데 그 뒤에 버스가 있으면 false
+        }
+      }
+      break; // 첫 번째 빈 플랫폼 이후는 모두 빈 플랫폼이어야 함
+    }
+  }
+  
+  return true;
+}
+
+/**
+ * @brief 진입/진출이 발생했는지 확인합니다.
+ * @return true: 진입 또는 진출이 발생, false: 발생하지 않음
+ */
+bool has_entry_or_exit_occurred() {
+  static int prev_entered_count = 0;
+  static int prev_exited_count = 0;
+  
+  bool entry_occurred = (entered_bus_count != prev_entered_count);
+  bool exit_occurred = (exited_bus_count != prev_exited_count);
+  
+  prev_entered_count = entered_bus_count;
+  prev_exited_count = exited_bus_count;
+  
+  return entry_occurred || exit_occurred;
+}
+
+/**
+ * @brief 공유 메모리 내용을 디버그 출력합니다.
+ */
+void debug_print_shared_memory() {
+  if (status_shm_ptr == nullptr) {
+    std::cout << "❌ Shared memory pointer is null" << std::endl;
+    return;
+  }
+  
+  std::cout << "\n🔍 === SHARED MEMORY DEBUG ===" << std::endl;
+  std::cout << "📊 Bus Counts:" << std::endl;
+  std::cout << "   Current: " << status_shm_ptr->current_bus_count << " buses" << std::endl;
+  std::cout << "   Entered: " << status_shm_ptr->entered_bus_count << " buses" << std::endl;
+  std::cout << "   Exited: " << status_shm_ptr->exited_bus_count << " buses" << std::endl;
+  std::cout << "   Net: " << (status_shm_ptr->entered_bus_count - status_shm_ptr->exited_bus_count) << " buses" << std::endl;
+  
+  std::cout << "🏁 Platform Status:" << std::endl;
+  for (int i = 0; i < 20; ++i) {
+    if (status_shm_ptr->platform_status[i] == -1) {
+      if (i == 18) {
+        std::cout << "   Exit Gate: GATE" << std::endl;
+      } else if (i == 19) {
+        std::cout << "   Entry Gate: GATE" << std::endl;
+      } else {
+        std::cout << "   Gate " << i << ": GATE" << std::endl;
+      }
+    } else if (status_shm_ptr->platform_status[i] >= 0) {
+      std::string status = (status_shm_ptr->platform_status[i] == 1) ? "BUS STOPPED" : "EMPTY";
+      std::cout << "   Platform " << i << ": " << status << std::endl;
+    }
+  }
+  
+  // 마지막 업데이트 시간
+  auto tm_updated = *std::localtime(&status_shm_ptr->updated_at);
+  std::cout << "⏰ Last Updated: " << std::put_time(&tm_updated, "%H:%M:%S") << std::endl;
+  std::cout << "🔍 === END SHARED MEMORY DEBUG ===" << std::endl;
+}
+
+/**
  * @brief 안정화된 상태를 공유 메모리에 업데이트합니다.
  */
 void update_shared_status(unsigned int platform_count) {
@@ -815,6 +1063,9 @@ void update_shared_status(unsigned int platform_count) {
   status_shm_ptr->current_bus_count = estimated_bus_in_station;
 
   status_shm_ptr->updated_at = time(nullptr);
+  
+  // 디버그 출력
+  //debug_print_shared_memory();
 }
 
 /**
@@ -1016,7 +1267,7 @@ int main(int argc, char* argv[]) {
                   cv::LINE_AA);
       
       // 조작키 안내 표시
-      std::string controls = "Controls: Q=Quit, R=Reset Bus Count";
+      std::string controls = "Controls: Q=Quit, R=Reset, X=Reset All, D=Debug";
       cv::putText(*debug_frame, controls, cv::Point(10, 60),
                   cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2,
                   cv::LINE_AA);
@@ -1028,35 +1279,63 @@ int main(int argc, char* argv[]) {
       if (masked_queue.try_pop(masked)) {
         // 픽셀 비율 정보를 저장할 구조체
         static PixelRatioInfo ratio_info;
-        check_bus_platform_with_ratios(*masked, BUS_PLATFORM_STATUS, ratio_info, 0.3, 0.15);
+        check_bus_platform_with_ratios(*masked, BUS_PLATFORM_STATUS, ratio_info, 0.3, 0.2);
 
-        // 첫 번째 프레임에서 초기 버스 수 설정
+        // 첫 번째 프레임에서 초기 버스 수 설정 (단순한 진입-진출 방식)
         if (!initial_bus_count_set.load()) {
           set_initial_bus_count(PLATFORM_SIZE, BUS_PLATFORM_STATUS);
           initial_bus_count_set = true;
           std::cout << "🎯 Initial bus count has been set based on current platform status" << std::endl;
         }
-        
-        // 초기 버스 수 설정 후 한 번만 보정 수행
-        if (initial_bus_count_set.load() && !bus_count_corrected.load()) {
-          correct_bus_count_if_needed(PLATFORM_SIZE, BUS_PLATFORM_STATUS);
-          bus_count_corrected = true;
-          std::cout << "🎯 Bus count correction completed" << std::endl;
-        }
 
         unsigned int stop_platform_count = PLATFORM_SIZE - 2;
         process_bus_status(stop_platform_count, BUS_PLATFORM_STATUS);
         process_gate_status(PLATFORM_SIZE, BUS_PLATFORM_STATUS);
-        process_entry_exit_status(PLATFORM_SIZE, BUS_PLATFORM_STATUS);
+        process_entry_exit_status(PLATFORM_SIZE, BUS_PLATFORM_STATUS);  // 안정화된 상태 변화 감지 활성화
 
-        update_shared_status(PLATFORM_SIZE);
+        // 조건부 공유 메모리 업데이트
+        bool should_update = false;
+        
+        // 조건 1: 진입 또는 진출이 발생한 경우
+        if (has_entry_or_exit_occurred()) {
+          should_update = true;
+          std::cout << "📝 Shared memory updated: Entry/Exit occurred" << std::endl;
+        }
+        // 조건 2: 플랫폼이 순차적으로 채워져 있거나 완전히 비어있는 경우
+        else if (is_platform_status_sequential(PLATFORM_SIZE)) {
+          should_update = true;
+          std::cout << "📝 Shared memory updated: Sequential platform status" << std::endl;
+        }
 
-        // 콘솔 디버그 출력
-        std::cout << "\n--- Bus Count ---" << std::endl;
+        // 콘솔 디버그 출력 (항상 출력)
+        static int prev_estimated_bus = -1;
+        static int prev_entered_count = -1;
+        static int prev_exited_count = -1;
+        static bool prev_platform_status[MAX_PLATFORM_COUNT] = {false};
+        
+        bool status_changed = false;
+        if (prev_estimated_bus != estimated_bus_in_station ||
+            prev_entered_count != entered_bus_count ||
+            prev_exited_count != exited_bus_count) {
+          status_changed = true;
+        }
+        
+        // 플랫폼 상태 변화 확인
+        for (unsigned int i = 0; i < stop_platform_count; i++) {
+          if (prev_platform_status[i] != (stable_status[i] != 0)) {
+            status_changed = true;
+            break;
+          }
+        }
+        
+        // 항상 디버그 정보 출력
+        std::cout << "\n--- Bus Count Status (Entry-Exit Method) ---" << std::endl;
         std::cout << "  Current: " << estimated_bus_in_station << " buses" << std::endl;
         std::cout << "  [Debug] Entered: " << entered_bus_count
                   << " | Exited: " << exited_bus_count
+                  << " | Net: " << (entered_bus_count - exited_bus_count)
                   << std::endl;
+        
         std::cout << "--- Platform Status ---" << std::endl;
         for (unsigned int i = 0; i < stop_platform_count; i++) {
           std::cout << "  Platform " << i << ": "
@@ -1067,44 +1346,105 @@ int main(int argc, char* argv[]) {
         std::cout << "  Entry Gate: " << (BUS_PLATFORM_STATUS[PLATFORM_SIZE - 1] ? "FILLED" : "EMPTY") << std::endl;
         std::cout << "  Exit Gate: " << (BUS_PLATFORM_STATUS[PLATFORM_SIZE - 2] ? "FILLED" : "EMPTY") << std::endl;
         
-        // 픽셀 비율 정보 출력
-        std::cout << "--- Pixel Ratios ---" << std::endl;
-        for (size_t i = 0; i < ratio_info.ratios.size(); ++i) {
-            std::string area_name;
-            if (i < stop_platform_count) {
-                area_name = "Platform " + std::to_string(i);
-            } else if (i == PLATFORM_SIZE - 2) {
-                area_name = "Exit Gate";
-            } else if (i == PLATFORM_SIZE - 1) {
-                area_name = "Entry Gate";
+        if (should_update) {
+          update_shared_status(PLATFORM_SIZE);
+        }
+
+        // 상태 업데이트
+        prev_estimated_bus = estimated_bus_in_station;
+        prev_entered_count = entered_bus_count;
+        prev_exited_count = exited_bus_count;
+        for (unsigned int i = 0; i < stop_platform_count; i++) {
+          prev_platform_status[i] = (stable_status[i] != 0);
+        }
+
+        // 진출 게이트 픽셀 비율 추적
+        if (PLATFORM_SIZE >= 2) {
+          unsigned int exit_gate_idx = PLATFORM_SIZE - 2;
+          if (exit_gate_idx < ratio_info.ratios.size()) {
+            double current_exit_ratio = ratio_info.ratios[exit_gate_idx];
+            
+            if (!exit_gate_ratio_initialized) {
+              exit_gate_max_ratio = current_exit_ratio;
+              exit_gate_min_ratio = current_exit_ratio;
+              exit_gate_ratio_initialized = true;
             } else {
-                area_name = "Unknown " + std::to_string(i);
+              if (current_exit_ratio > exit_gate_max_ratio) {
+                exit_gate_max_ratio = current_exit_ratio;
+              }
+              if (current_exit_ratio < exit_gate_min_ratio) {
+                exit_gate_min_ratio = current_exit_ratio;
+              }
             }
-            
-            double ratio_percent = ratio_info.ratios[i] * 100.0;
-            double threshold_percent = ratio_info.thresholds[i] * 100.0;
-            std::string result = ratio_info.results[i] ? "DETECTED" : "EMPTY";
-            
-            std::cout << "  " << area_name << ": " 
-                      << std::fixed << std::setprecision(2) << ratio_percent << "%"
-                      << " (threshold: " << threshold_percent << "%) -> " << result << std::endl;
+          }
+        }
+        
+        // 픽셀 비율 정보 출력 (디버그 모드에서만)
+        if (debug_mode) {
+          std::cout << "--- Pixel Ratios ---" << std::endl;
+          for (size_t i = 0; i < ratio_info.ratios.size(); ++i) {
+              std::string area_name;
+              if (i < stop_platform_count) {
+                  area_name = "Platform " + std::to_string(i);
+              } else if (i == PLATFORM_SIZE - 2) {
+                  area_name = "Exit Gate";
+              } else if (i == PLATFORM_SIZE - 1) {
+                  area_name = "Entry Gate";
+              } else {
+                  area_name = "Unknown " + std::to_string(i);
+              }
+              
+              double ratio_percent = ratio_info.ratios[i] * 100.0;
+              double threshold_percent = ratio_info.thresholds[i] * 100.0;
+              std::string result = ratio_info.results[i] ? "DETECTED" : "EMPTY";
+              
+              std::cout << "  " << area_name << ": " 
+                        << std::fixed << std::setprecision(2) << ratio_percent << "%"
+                        << " (threshold: " << threshold_percent << "%) -> " << result << std::endl;
+          }
+          
+          // 진출 게이트 픽셀 비율 범위 출력
+          if (exit_gate_ratio_initialized) {
+            std::cout << "--- Exit Gate Pixel Ratio Range ---" << std::endl;
+            std::cout << "  Min: " << std::fixed << std::setprecision(4) << (exit_gate_min_ratio * 100.0) << "%" << std::endl;
+            std::cout << "  Max: " << std::fixed << std::setprecision(4) << (exit_gate_max_ratio * 100.0) << "%" << std::endl;
+          }
         }
         last_masked_frames = *masked;
       }
     }
 
+    // 마스크 윈도우 업데이트 (변화가 있을 때만)
+    static std::vector<cv::Mat> prev_masked_frames;
+    bool masks_changed = false;
+    
     if (!last_masked_frames.empty()) {
-      int base_x = 520;
-      int current_y = 280;
-      int padding = 40;
-
-      for (size_t i = 0; i < last_masked_frames.size(); ++i) {
-        if (!last_masked_frames[i].empty()) {
-          std::string win_name = "Platform Mask " + std::to_string(i);
-          cv::imshow(win_name, last_masked_frames[i]);
-          cv::moveWindow(win_name, base_x, current_y);
-          current_y += last_masked_frames[i].rows + padding;
+      if (prev_masked_frames.size() != last_masked_frames.size()) {
+        masks_changed = true;
+      } else {
+        for (size_t i = 0; i < last_masked_frames.size(); ++i) {
+          if (last_masked_frames[i].size() != prev_masked_frames[i].size() ||
+              cv::countNonZero(last_masked_frames[i] != prev_masked_frames[i]) > 0) {
+            masks_changed = true;
+            break;
+          }
         }
+      }
+      
+      if (masks_changed) {
+        int base_x = 520;
+        int current_y = 280;
+        int padding = 40;
+
+        for (size_t i = 0; i < last_masked_frames.size(); ++i) {
+          if (!last_masked_frames[i].empty()) {
+            std::string win_name = "Platform Mask " + std::to_string(i);
+            cv::imshow(win_name, last_masked_frames[i]);
+            cv::moveWindow(win_name, base_x, current_y);
+            current_y += last_masked_frames[i].rows + padding;
+          }
+        }
+        prev_masked_frames = last_masked_frames;
       }
     }
 
@@ -1118,6 +1458,18 @@ int main(int argc, char* argv[]) {
       } else {
         std::cout << "⚠️  Cannot reset bus count: ROI not configured yet" << std::endl;
       }
+    } else if (key == 'x' || key == 'X') {
+      // X키를 누르면 카운터 완전 리셋
+      if (is_config_ready.load() && PLATFORM_SIZE >= 2) {
+        reset_platform_status(PLATFORM_SIZE);
+        std::cout << "🔄 All counters reset to zero" << std::endl;
+      } else {
+        std::cout << "⚠️  Cannot reset counters: ROI not configured yet" << std::endl;
+      }
+    } else if (key == 'd' || key == 'D') {
+      // D키를 누르면 디버그 모드 토글
+      debug_mode = !debug_mode;
+      std::cout << "🔧 Debug mode: " << (debug_mode ? "ON" : "OFF") << std::endl;
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(10));

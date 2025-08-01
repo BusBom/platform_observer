@@ -14,19 +14,21 @@
 // 공유 메모리 구조체 정의
 struct StopStatus {
   int platform_status[20];  // 0: empty, 1: stopped
-  char station_id[20];      // 정류장 ID
+  char station_id[16];      // 정류장 ID (main.cpp와 동일하게 16바이트)
   time_t updated_at;        // 마지막 업데이트 시간
   int current_bus_count;    // 현재 정류장 내 버스 수
   int entered_bus_count;    // 누적 진입 버스 수
   int exited_bus_count;     // 누적 진출 버스 수
 };
 
-
-
 // 전역 변수
 std::atomic<bool> running(true);
 int status_shm_fd = -1;
 StopStatus* status_shm_ptr = nullptr;
+
+// 이전 값 저장용 변수
+StopStatus prev_status;
+bool first_run = true;
 
 void signal_handler(int signum) {
   std::cout << "\n종료 신호를 받았습니다. 프로그램을 종료합니다..." << std::endl;
@@ -63,8 +65,51 @@ void cleanup_status_shm() {
   std::cout << "Shared memory connection cleaned up." << std::endl;
 }
 
+bool has_status_changed() {
+  if (first_run) {
+    // 첫 실행 시 이전 값 저장
+    memcpy(&prev_status, status_shm_ptr, sizeof(StopStatus));
+    first_run = false;
+    return true;  // 첫 실행은 항상 출력
+  }
+  
+  // updated_at을 제외한 값들 비교
+  if (prev_status.current_bus_count != status_shm_ptr->current_bus_count ||
+      prev_status.entered_bus_count != status_shm_ptr->entered_bus_count ||
+      prev_status.exited_bus_count != status_shm_ptr->exited_bus_count) {
+    
+    // 플랫폼 상태 비교
+    for (int i = 0; i < 20; ++i) {
+      if (prev_status.platform_status[i] != status_shm_ptr->platform_status[i]) {
+        // 변경된 값 저장
+        memcpy(&prev_status, status_shm_ptr, sizeof(StopStatus));
+        return true;
+      }
+    }
+    
+    // 버스 카운트만 변경된 경우
+    memcpy(&prev_status, status_shm_ptr, sizeof(StopStatus));
+    return true;
+  }
+  
+  // 플랫폼 상태만 변경된 경우
+  for (int i = 0; i < 20; ++i) {
+    if (prev_status.platform_status[i] != status_shm_ptr->platform_status[i]) {
+      memcpy(&prev_status, status_shm_ptr, sizeof(StopStatus));
+      return true;
+    }
+  }
+  
+  return false;  // 변경 없음
+}
+
 void print_status() {
   if (status_shm_ptr == nullptr) return;
+
+  // 값이 변경되지 않았으면 출력하지 않음
+  if (!has_status_changed()) {
+    return;
+  }
 
   // 현재 시간
   auto now = std::chrono::system_clock::now();
@@ -139,7 +184,7 @@ int main() {
   signal(SIGINT, signal_handler);
   signal(SIGTERM, signal_handler);
 
-  std::cout << "🚌 Bus station status monitor starting..." << std::endl;
+  std::cout << "🚌 Bus station status monitor (continuous)" << std::endl;
   std::cout << "Connecting to shared memory /busbom_status..." << std::endl;
 
   if (!setup_status_shm()) {

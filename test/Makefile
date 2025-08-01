@@ -4,7 +4,7 @@ TARGET = test_monitor
 SOURCE = test.cpp
 
 $(TARGET): $(SOURCE)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SOURCE) -lrt
+	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SOURCE) -lrt -pthread
 
 clean:
 	rm -f $(TARGET)
