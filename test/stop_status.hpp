@@ -7,7 +7,7 @@
 
 struct StopStatus {
   int platform_status[MAX_PLATFORM_COUNT];  // 0: empty, 1: stopped
-  char station_id[16];
+  char station_id[20];
   time_t updated_at;
 
   // --- 추가 필드 ---
