@@ -4,9 +4,11 @@ TARGET = test_monitor
 SOURCE = test.cpp
 
 $(TARGET): $(SOURCE)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SOURCE) -lrt -pthread
+	$(CXX) $(CXXFLAGS) -lrt -pthread -o $(TARGET) $(SOURCE)
 
 clean:
 	rm -f $(TARGET)
 
 .PHONY: clean 
+
+#g++ -v test.cpp -o test_monitor -lrt -pthread

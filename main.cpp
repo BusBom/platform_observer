@@ -86,7 +86,7 @@ static const int ENTRY_DETECTION_THRESHOLD = 8;  // 연속 5회 감지되면 입
 static std::chrono::steady_clock::time_point last_entry_gate_detection_time;
 static std::chrono::steady_clock::time_point last_exit_gate_detection_time;
 static const double ENTRY_GATE_COOLDOWN_TIME = 8.0;  // 진입 게이트 쿨다운 시간 (초)
-static const double EXIT_GATE_COOLDOWN_TIME = 3.0;   // 진출 게이트 쿨다운 시간 (초)
+static const double EXIT_GATE_COOLDOWN_TIME = 4.0;   // 진출 게이트 쿨다운 시간 (초)
 
 // --- 진출 게이트 픽셀 비율 추적 변수 ---
 static double exit_gate_max_ratio = 0.0;  // 진출 게이트 최대 픽셀 비율
@@ -1246,6 +1246,19 @@ int main(int argc, char* argv[]) {
   cv::namedWindow("Debug View");
   cv::moveWindow("Debug View", 600, 280);
 
+  cv::namedWindow("Platform Mask 0", cv::WINDOW_NORMAL);
+  cv::resizeWindow("Platform Mask 0", 100, 200);
+  cv::namedWindow("Platform Mask 1", cv::WINDOW_NORMAL);
+  cv::resizeWindow("Platform Mask 1", 100, 200);
+  cv::namedWindow("Platform Mask 2", cv::WINDOW_NORMAL);
+  cv::resizeWindow("Platform Mask 2", 100, 200);
+  cv::namedWindow("Platform Mask 3", cv::WINDOW_NORMAL);
+  cv::resizeWindow("Platform Mask 3", 100, 200);
+  cv::namedWindow("Platform Mask 4", cv::WINDOW_NORMAL);
+  cv::resizeWindow("Platform Mask 4", 100, 200);
+  cv::namedWindow("Platform Mask 5", cv::WINDOW_NORMAL);
+  cv::resizeWindow("Platform Mask 5", 100, 200);
+
   while (running.load()) {
     if (is_config_ready.load() && !processing_threads_started) {
       std::cout
@@ -1440,7 +1453,6 @@ int main(int argc, char* argv[]) {
           if (!last_masked_frames[i].empty()) {
             std::string win_name = "Platform Mask " + std::to_string(i);
             cv::imshow(win_name, last_masked_frames[i]);
-            cv::moveWindow(win_name, base_x, current_y);
             current_y += last_masked_frames[i].rows + padding;
           }
         }

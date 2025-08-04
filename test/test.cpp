@@ -9,7 +9,9 @@
 // 시스템 헤더
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <sys/shm.h>
 
 // 공유 메모리 구조체 정의
 struct StopStatus {
