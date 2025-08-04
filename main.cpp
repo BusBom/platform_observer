@@ -9,6 +9,9 @@
 #include <iomanip>
 #include <iostream>
 #include <thread>
+#include <sstream>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 // 시스템 헤더
 #include <fcntl.h>       // 공유 메모리
@@ -121,6 +124,11 @@ unsigned int frame_wasted = 0;
 unsigned int warped_wasted = 0;
 unsigned int masked_wasted = 0;
 
+// --- 이미지 저장용 변수 ---
+static int saved_frame_count = 0;
+static const int SAVE_INTERVAL = 30;  // 30프레임마다 저장 (약 2초마다)
+static std::chrono::steady_clock::time_point last_save_time;
+
 // --- 입출구 관련 변수 ---
 // [추가] 입출구 감지 상태 및 시간 보정 변수
 bool prev_entry_roi_filled = false;
@@ -153,6 +161,9 @@ void process_entry_exit_status(unsigned int total_platform_count,
                               const bool* raw_status);
 void update_shared_status(unsigned int platform_count);
 void video_read_thread(const std::string& video_filename);
+void save_processing_images(const cv::Mat& original_frame, 
+                           const std::vector<cv::Mat>& warped_images,
+                           const std::vector<cv::Mat>& masked_images);
 
 void signal_handler(int signum) {
   std::cout << "\nTermination signal received. Shutting down..." << std::endl;
@@ -1243,6 +1254,10 @@ int main(int argc, char* argv[]) {
             << std::endl;
 
   std::vector<cv::Mat> last_masked_frames;
+  
+  // 이미지 저장 초기화
+  last_save_time = std::chrono::steady_clock::now();
+  
   cv::namedWindow("Debug View");
   cv::moveWindow("Debug View", 600, 280);
 
@@ -1293,6 +1308,25 @@ int main(int argc, char* argv[]) {
         // 픽셀 비율 정보를 저장할 구조체
         static PixelRatioInfo ratio_info;
         check_bus_platform_with_ratios(*masked, BUS_PLATFORM_STATUS, ratio_info, 0.3, 0.2);
+
+        // 이미지 저장 기능 호출
+        static cv::Mat last_original_frame;
+        static std::vector<cv::Mat> last_warped_frames;
+        
+        // 원본 프레임과 투시 변환된 프레임을 가져와서 저장
+        std::shared_ptr<cv::Mat> current_frame;
+        std::shared_ptr<std::vector<cv::Mat>> current_warped;
+        
+        if (debug_frame_queue.try_pop(current_frame)) {
+          last_original_frame = current_frame->clone();
+        }
+        
+        if (warped_queue.try_pop(current_warped)) {
+          last_warped_frames = *current_warped;
+        }
+        
+        // 이미지 저장 (2초마다)
+        save_processing_images(last_original_frame, last_warped_frames, *masked);
 
         // 첫 번째 프레임에서 초기 버스 수 설정 (단순한 진입-진출 방식)
         if (!initial_bus_count_set.load()) {
@@ -1535,4 +1569,63 @@ void update_bus_count_by_entry_exit(unsigned int platform_count, const bool* raw
 
   prev_entry_roi_filled = current_entry_filled;
   prev_exit_roi_filled = current_exit_filled;
+}
+
+/**
+ * @brief 각 단계별로 이미지를 저장하는 함수
+ */
+void save_processing_images(const cv::Mat& original_frame, 
+                           const std::vector<cv::Mat>& warped_images,
+                           const std::vector<cv::Mat>& masked_images) {
+  auto now = std::chrono::steady_clock::now();
+  auto time_since_last_save = std::chrono::duration_cast<std::chrono::duration<double>>(
+      now - last_save_time).count();
+  
+  // 저장 간격 확인 (최소 2초 간격)
+  if (time_since_last_save < 2.0) {
+    return;
+  }
+  
+  // img 폴더 생성 확인
+  std::string img_dir = "img";
+  struct stat st = {0};
+  if (stat(img_dir.c_str(), &st) == -1) {
+    mkdir(img_dir.c_str(), 0700);
+  }
+  
+  // 타임스탬프 생성
+  auto timestamp = std::chrono::system_clock::now();
+  auto time_t = std::chrono::system_clock::to_time_t(timestamp);
+  std::stringstream ss;
+  ss << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
+  std::string timestamp_str = ss.str();
+  
+  // 1. 원본 프레임 저장
+  if (!original_frame.empty()) {
+    std::string original_filename = img_dir + "/original_" + timestamp_str + ".jpg";
+    cv::imwrite(original_filename, original_frame);
+    std::cout << "💾 Saved original frame: " << original_filename << std::endl;
+  }
+  
+  // 2. 투시 변환된 이미지들 저장
+  for (size_t i = 0; i < warped_images.size(); ++i) {
+    if (!warped_images[i].empty()) {
+      std::string warped_filename = img_dir + "/warped_" + std::to_string(i) + "_" + timestamp_str + ".jpg";
+      cv::imwrite(warped_filename, warped_images[i]);
+      std::cout << "💾 Saved warped image " << i << ": " << warped_filename << std::endl;
+    }
+  }
+  
+  // 3. 마스킹된 이미지들 저장
+  for (size_t i = 0; i < masked_images.size(); ++i) {
+    if (!masked_images[i].empty()) {
+      std::string masked_filename = img_dir + "/masked_" + std::to_string(i) + "_" + timestamp_str + ".jpg";
+      cv::imwrite(masked_filename, masked_images[i]);
+      std::cout << "💾 Saved masked image " << i << ": " << masked_filename << std::endl;
+    }
+  }
+  
+  last_save_time = now;
+  saved_frame_count++;
+  std::cout << "📸 Image capture completed (total: " << saved_frame_count << ")" << std::endl;
 }
