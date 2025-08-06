@@ -39,7 +39,7 @@ Detection results are written to shared memory for use by other processes (e.g.,
 
 ## System Architecture
 
-<img width="5368" height="3008" alt="image" src="https://github.com/user-attachments/assets/2ae1cd16-7c6e-4799-9b81-b70dafae1975" />
+<img width="5364" height="3004" alt="image" src="https://github.com/user-attachments/assets/68cb192d-a82f-4075-97bf-1ec9ec086581" />
 
 ---
 
